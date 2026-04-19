@@ -173,15 +173,21 @@ def extract_comment(cursor: clang.cindex.Cursor, source_lines: list[str]) -> str
     return " ".join(comments)
 
 
-def _insert_third_party_methods(
+def _insert_header_methods(
     type_cursor: clang.cindex.Cursor,
     file_id: int,
     conn: sqlite3.Connection,
 ) -> None:
-    """Insert method declarations for a third-party type so query.py can annotate them."""
+    """Insert methods of a type whose definitions live in a header file.
+
+    Handles both third-party types (declarations, no source) and project types
+    with inline definitions (captures source code and is_definition=1).
+    Skips any method already present at the same (qualified_name, line_start).
+    """
     method_kinds = {_ck.CXX_METHOD, _ck.CONSTRUCTOR, _ck.DESTRUCTOR, _ck.FUNCTION_TEMPLATE}
-    hdr_path = type_cursor.location.file.name if type_cursor.location.file else None
+    hdr_path  = type_cursor.location.file.name if type_cursor.location.file else None
     hdr_lines = read_lines(hdr_path) if hdr_path else []
+
     for child in type_cursor.get_children():
         if child.kind not in method_kinds:
             continue
@@ -189,21 +195,24 @@ def _insert_third_party_methods(
         if not qname:
             continue
         ext = child.extent
-        exists = conn.execute(
+        if conn.execute(
             "SELECT 1 FROM functions WHERE qualified_name = ? AND line_start = ? LIMIT 1",
             (qname, ext.start.line),
-        ).fetchone()
-        if exists:
+        ).fetchone():
             continue
+
+        is_def  = int(child.is_definition())
+        code    = slice_source(hdr_lines, ext.start.line, ext.end.line) if is_def and hdr_lines else ""
         comment = extract_comment(child, hdr_lines)
+
         conn.execute(
             """INSERT INTO functions
                (qualified_name, display_name, file_id, line_start, line_end,
                 kind, is_definition, source_code, comment)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (qname, child.displayname, file_id,
+            (qname, _method_signature(child), file_id,
              ext.start.line, ext.end.line,
-             child.kind.name, 0, "", comment),
+             child.kind.name, is_def, code, comment),
         )
 
 
@@ -240,9 +249,25 @@ def type_summary(cursor: clang.cindex.Cursor) -> str:
         elif child.kind in (
             _ck.CXX_METHOD, _ck.CONSTRUCTOR, _ck.DESTRUCTOR, _ck.FUNCTION_TEMPLATE
         ):
-            lines.append(f"  {child.displayname};")
+            lines.append(f"  {_method_signature(child)};")
     lines.append("};")
     return "\n".join(lines)
+
+
+def _method_signature(cursor: clang.cindex.Cursor) -> str:
+    """Build a method signature with return type and parameter names.
+
+    e.g. mmdb::Residue * GetResidue(int seqNum, const char *insCode)
+    """
+    params = ", ".join(
+        f"{arg.type.spelling} {arg.spelling}".strip()
+        for arg in cursor.get_arguments()
+    )
+    name        = cursor.spelling or cursor.displayname.split("(")[0]
+    return_type = cursor.result_type.spelling
+    if return_type and cursor.kind not in (_ck.CONSTRUCTOR, _ck.DESTRUCTOR):
+        return f"{return_type} {name}({params})"
+    return f"{name}({params})"
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +389,7 @@ def process_file(
                    (qualified_name, display_name, file_id, line_start, line_end,
                     kind, is_definition, source_code, comment)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (qname, cursor.displayname, file_id,
+                (qname, _method_signature(cursor), file_id,
                  ext.start.line, ext.end.line,
                  cursor.kind.name, int(cursor.is_definition()), code, comment),
             )
@@ -413,8 +438,10 @@ def process_file(
                 if conn.execute("SELECT changes()").fetchone()[0]:
                     n_types += 1
 
-                if in_third_party:
-                    _insert_third_party_methods(cursor, hdr_id, conn)
+                # Capture inline methods for any type whose definition is in a
+                # header — both third-party declarations and project inline defs.
+                if in_third_party or (in_project and loc_path != file_path):
+                    _insert_header_methods(cursor, hdr_id, conn)
 
         for child in cursor.get_children():
             collect_types(child)

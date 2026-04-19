@@ -32,8 +32,8 @@ MAX_SRC_CHARS = 2000  # truncate very long functions before sending
 PROMPT_TEMPLATE = """\
 Summarize the following C++ function in one sentence (maximum 20 words).
 Focus on what it does, not how it does it.
-Reply with only the summary sentence — no explanation, no punctuation other than a full stop. 
-Don't refer to the function as a thing by using it, just say what it does.
+Reply with only the summary sentence, if it takes in / returns something, try and explain what it is, but be brief.
+Maximum two sentences. 
 
 {source}
 """
