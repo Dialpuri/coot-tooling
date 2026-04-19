@@ -10,57 +10,53 @@ Run with the faiss conda env active:
   conda activate faiss
   python ast-script/build_index.py
 """
+import argparse
 import json
 import os
 import sqlite3
 from pathlib import Path
-
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
 # ---------------------------------------------------------------------------
-# Config
+# Defaults (overridable via CLI)
 # ---------------------------------------------------------------------------
-DB_PATH    = Path(__file__).parent.parent / "ast-data" / "code_graph.db"
-INDEX_PATH = Path(__file__).parent.parent / "ast-data" / "index.faiss"
-META_PATH  = Path(__file__).parent.parent / "ast-data" / "index_meta.json"
-PROJECT_ROOT = "/Users/dialpuri/lmb/coot"
-
-# MODEL_NAME  = "BAAI/bge-small-en-v1.5"
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-BATCH_SIZE  = 64
-MAX_CODE_CHARS = 3000   # truncate very long function bodies before embedding
+DEFAULT_DB         = Path(__file__).parent.parent / "ast-data" / "code_graph.db"
+DEFAULT_INDEX      = Path(__file__).parent.parent / "ast-data" / "index.faiss"
+DEFAULT_META       = Path(__file__).parent.parent / "ast-data" / "index_meta.json"
+DEFAULT_MODEL      = "google/embeddinggemma-300m"
+DEFAULT_BATCH_SIZE = 64
+MAX_CODE_CHARS     = 3000
 
 
 # ---------------------------------------------------------------------------
 # Context document assembly
 # ---------------------------------------------------------------------------
 
-def build_document(fn: dict, type_summaries: list[str], callees: list[str]) -> str:
-    """Produce a single string capturing everything the model needs to understand this function."""
-    rel_file = fn["file"].replace(PROJECT_ROOT + "/", "")
+def build_document(fn: dict, callees: list[str], project_root: str = "") -> str:
+    """Produce a single string for embedding.
 
-    parts = [
-        f"Function: {fn['qualified_name']}",
-        f"File: {rel_file}:{fn['line_start']}",
-    ]
+    Ordered so that the most library-agnostic signal (comment/summary) comes
+    first — sentence transformers weight earlier tokens more heavily and have a
+    256-token limit, so source code is included last and truncated if needed.
+    """
+    parts = []
+
+    # Lead with the human-readable summary — best signal for cross-library matching
+    if fn.get("comment"):
+        parts.append(fn["comment"])
+
+    parts.append(f"Function: {fn['qualified_name']}")
 
     if callees:
-        parts.append("Calls: " + ", ".join(callees[:20]))
-
-    if type_summaries:
-        parts.append("\nUsed types:")
-        for s in type_summaries:
-            parts.append(s)
+        parts.append("Calls: " + ", ".join(callees[:10]))
 
     if fn["source_code"]:
         code = fn["source_code"]
         if len(code) > MAX_CODE_CHARS:
             code = code[:MAX_CODE_CHARS] + "\n// ... (truncated)"
-        parts.append("\nSource:")
         parts.append(code)
 
     return "\n".join(parts)
@@ -71,14 +67,27 @@ def build_document(fn: dict, type_summaries: list[str], callees: list[str]) -> s
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    parser = argparse.ArgumentParser(description="Build FAISS embedding index from code_graph.db")
+    parser.add_argument("--db",         default=DEFAULT_DB,         type=Path, help="Path to code_graph.db")
+    parser.add_argument("--index",      default=DEFAULT_INDEX,      type=Path, help="Output .faiss file")
+    parser.add_argument("--meta",       default=DEFAULT_META,       type=Path, help="Output index_meta.json")
+    parser.add_argument("--model",      default=DEFAULT_MODEL,                 help="HuggingFace model name or local path")
+    parser.add_argument("--batch-size", default=DEFAULT_BATCH_SIZE, type=int,  help="Embedding batch size")
+    parser.add_argument("--project-root", default="",                          help="Strip this prefix from file paths in documents")
+    parser.add_argument("--offline",    action="store_true",                   help="Set HF_HUB_OFFLINE=1 (use cached model only)")
+    args = parser.parse_args()
+
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+
+    conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
 
     # Load all function definitions (declarations have no source, less useful)
     functions = conn.execute("""
         SELECT f.id, f.qualified_name, f.display_name,
                fi.path AS file, f.line_start, f.line_end,
-               f.kind, f.source_code
+               f.kind, f.source_code, f.comment
         FROM functions f
         JOIN files fi ON fi.id = f.file_id
         WHERE f.is_definition = 1
@@ -91,16 +100,6 @@ def main() -> None:
     for row in conn.execute("SELECT caller_id, callee_qualified_name FROM calls"):
         callee_map.setdefault(row[0], []).append(row[1])
 
-    # Pre-load type summaries per function (function_id -> [summary, ...])
-    type_map: dict[int, list[str]] = {}
-    for row in conn.execute("""
-        SELECT u.function_id, t.summary
-        FROM uses_type u
-        JOIN types t ON t.qualified_name = u.type_qualified_name
-        WHERE t.summary IS NOT NULL
-    """):
-        type_map.setdefault(row[0], []).append(row[1])
-
     conn.close()
 
     # Build one document per function
@@ -110,8 +109,8 @@ def main() -> None:
         fn_id    = fn["id"]
         doc      = build_document(
             dict(fn),
-            type_map.get(fn_id, []),
             callee_map.get(fn_id, []),
+            args.project_root,
         )
         documents.append(doc)
         metadata.append({
@@ -125,13 +124,13 @@ def main() -> None:
         })
 
     # Embed
-    print(f"Loading model: {MODEL_NAME}  (downloads on first run)")
-    model = SentenceTransformer(MODEL_NAME)
+    print(f"Loading model: {args.model}")
+    model = SentenceTransformer(args.model)
 
-    print(f"Embedding {len(documents)} documents in batches of {BATCH_SIZE}...")
+    print(f"Embedding {len(documents)} documents in batches of {args.batch_size}...")
     embeddings = model.encode(
         documents,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         show_progress_bar=True,
         normalize_embeddings=True,   # unit vectors -> cosine sim via dot product
         convert_to_numpy=True,
@@ -143,12 +142,12 @@ def main() -> None:
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
-    faiss.write_index(index, str(INDEX_PATH))
-    META_PATH.write_text(json.dumps(metadata, indent=2))
+    faiss.write_index(index, str(args.index))
+    args.meta.write_text(json.dumps(metadata, indent=2))
 
     print(
-        f"\nIndex written to  {INDEX_PATH}  ({index.ntotal} vectors, dim={dim})\n"
-        f"Metadata written to {META_PATH}"
+        f"\nIndex written to  {args.index}  ({index.ntotal} vectors, dim={dim})\n"
+        f"Metadata written to {args.meta}"
     )
 
 
