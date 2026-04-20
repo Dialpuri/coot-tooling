@@ -38,7 +38,8 @@ INDEX_PATH = Path(__file__).parent.parent / "ast-data" / "index.faiss"
 META_PATH  = Path(__file__).parent.parent / "ast-data" / "index_meta.json"
 PROJECT_ROOT = "/Users/dialpuri/lmb/coot"
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_NAME = "google/embeddinggemma-300m"
+
 
 
 # ---------------------------------------------------------------------------
@@ -480,12 +481,12 @@ def query(
         print(f"  {rank}. [{score:.3f}] {m['qualified_name']}  ({rel}:{m['line_start']})")
         seed_ids.append(m["function_id"])
 
-    print(f"\nExpanding {hops} hop(s) over call graph...")
-    fn_records, type_records = expand(conn, seed_ids, hops, include_types)
-    print(f"Context: {len(fn_records)} functions, {len(type_records)} types")
-
-    return render_context(fn_records, type_records)
-
+    # print(f"\nExpanding {hops} hop(s) over call graph...")
+    # fn_records, type_records = expand(conn, seed_ids, hops, include_types)
+    # print(f"Context: {len(fn_records)} functions, {len(type_records)} types")
+    #
+    # return render_context(fn_records, type_records)
+    return ""
 
 # ---------------------------------------------------------------------------
 # CLI
