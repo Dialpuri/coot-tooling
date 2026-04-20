@@ -104,10 +104,16 @@ def generate_test(
 
         test_subdir = oracle_dir / "test"
         _conn = conn or connect()
+
+        # Load oracle trace if it exists
+        oracle_trace_path = oracle_subdir / "agent_trace.txt"
+        oracle_trace = oracle_trace_path.read_text() if oracle_trace_path.exists() else None
+
         try:
             test_src, trace = generate_test_with_agent(
-                _conn, oracle_cc.read_text(), result.stdout,
-                test_subdir=test_subdir, model=model, verbose=verbose,
+                _conn, oracle_cc.read_text(), result,
+                test_subdir=test_subdir, model=model,
+                oracle_trace=oracle_trace, verbose=verbose,
             )
         finally:
             if conn is None:
@@ -121,10 +127,21 @@ def generate_test(
         return test_cc
 
     # Non-agentic single-shot generation.
+    if result.cases:
+        cases_text = f"Oracle produced {len(result.cases)} test case(s):\n"
+        for i, case in enumerate(result.cases, 1):
+            cases_text += f"\nCase {i}:\n"
+            for k, v in case["inputs"].items():
+                cases_text += f"  INPUT  {k}: {v}\n"
+            for k, v in case["outputs"].items():
+                cases_text += f"  OUTPUT {k}: {v}\n"
+    else:
+        cases_text = f"Observed output:\n{result.stdout}\n"
+
     user_msg = (
         f"Here is the oracle program:\n\n```cpp\n{oracle_cc.read_text()}\n```\n\n"
-        f"Observed output when run:\n{result.stdout}\n\n"
-        "Convert this into a Google Test suite using the observed values as expected values."
+        + cases_text
+        + "\nConvert this into a Google Test suite using the observed values as expected values."
     )
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},

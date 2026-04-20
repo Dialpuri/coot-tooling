@@ -66,6 +66,14 @@ Use C++ code where possible, avoid C style code.\
 """
 
 _MAX_COMPILE_ATTEMPTS = 3
+_EXTENSION_TURNS = 10
+_MAX_EXTENSIONS  = 1
+_EXTENSION_PROMPT = (
+    "You have used all available turns. "
+    "If you still need to compile, run, or fix errors, respond with tool calls "
+    "and you will receive {n} more turns. "
+    "If you are done, output the final program in a ```cpp block now."
+)
 
 # ── tool schema ───────────────────────────────────────────────────────────────
 
@@ -626,36 +634,10 @@ def generate_with_agent(
         return _dispatch(conn, name, args)
 
     tools = ORACLE_TOOLS if oracle_out else TOOLS
-    max_turns = 20
     oracle_code: str | None = None
 
-    for turn in range(max_turns):
-        data = _chat(messages, model, tools)
-        msg  = data.get("message", {})
-        tool_calls = msg.get("tool_calls") or []
-
-        thinking          = msg.get("thinking", "") or ""
-        assistant_content = msg.get("content",  "") or ""
-        messages.append({"role": "assistant", "content": assistant_content,
-                          "tool_calls": tool_calls})
-
-        if thinking:
-            if verbose:
-                print(f"\n[thinking]\n{textwrap.indent(thinking, '  ')}\n")
-            trace_lines.append(f"[thinking — turn {turn + 1}]\n{textwrap.indent(thinking, '  ')}\n")
-
-        if not tool_calls:
-            # Model is done — extract the oracle code from the response.
-            trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")
-            import re
-            m = re.search(r"```(?:cpp|c\+\+)?\n(.*?)```", assistant_content, re.DOTALL)
-            oracle_code = m.group(1).strip() if m else assistant_content.strip()
-            break
-
-        # Execute each tool call and collect results.
-        trace_lines.append(f"[assistant — turn {turn + 1}, {len(tool_calls)} tool call(s)]")
-        tool_results: list[dict] = []
-
+    def _run_tool_calls(tool_calls: list, label: str = "") -> list[dict]:
+        results: list[dict] = []
         for call in tool_calls:
             fn_info = call.get("function", {})
             name    = fn_info.get("name", "")
@@ -665,30 +647,88 @@ def generate_with_agent(
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-
             if verbose:
                 print(f"  tool: {name}({args})")
-
             result = dispatch(name, args)
-
-
-            # Cap individual tool results to avoid blowing up the context.
             result_lines = result.splitlines()
             if len(result_lines) > 150:
                 result = "\n".join(result_lines[:150]) + f"\n... ({len(result_lines) - 150} more lines)"
-
             trace_lines.append(f"  → {name}({json.dumps(args)})")
             trace_lines.append(textwrap.indent(result, "      ") + "\n")
+            results.append({"role": "tool", "content": result})
+        return results
 
-            tool_results.append({
-                "role":    "tool",
-                "content": result,
-            })
+    def _extract_code(content: str) -> str:
+        m = re.search(r"```(?:cpp|c\+\+)?\n(.*?)```", content, re.DOTALL)
+        return m.group(1).strip() if m else content.strip()
 
-        messages.extend(tool_results)
+    for turn in range(20):
+        data = _chat(messages, model, tools)
+        msg  = data.get("message", {})
+        tool_calls        = msg.get("tool_calls") or []
+        thinking          = msg.get("thinking", "") or ""
+        assistant_content = msg.get("content",  "") or ""
+        messages.append({"role": "assistant", "content": assistant_content,
+                         "tool_calls": tool_calls})
+
+        if thinking:
+            if verbose:
+                print(f"\n[thinking]\n{textwrap.indent(thinking, '  ')}\n")
+            trace_lines.append(f"[thinking — turn {turn + 1}]\n{textwrap.indent(thinking, '  ')}\n")
+
+        if not tool_calls:
+            trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")
+            oracle_code = _extract_code(assistant_content)
+            break
+
+        trace_lines.append(f"[assistant — turn {turn + 1}, {len(tool_calls)} tool call(s)]")
+        messages.extend(_run_tool_calls(tool_calls))
 
     else:
-        trace_lines.append("[agent] Max turns reached without a final answer.\n")
+        # All 20 turns used — ask once if more time is needed.
+        trace_lines.append("[agent] Turn limit reached — asking for extension.\n")
+        messages.append({"role": "user",
+                         "content": _EXTENSION_PROMPT.format(n=_EXTENSION_TURNS)})
+
+        data = _chat(messages, model, tools)
+        msg  = data.get("message", {})
+        tool_calls        = msg.get("tool_calls") or []
+        thinking          = msg.get("thinking", "") or ""
+        assistant_content = msg.get("content",  "") or ""
+        messages.append({"role": "assistant", "content": assistant_content,
+                         "tool_calls": tool_calls})
+
+        if thinking:
+            trace_lines.append(f"[thinking — extension]\n{textwrap.indent(thinking, '  ')}\n")
+
+        if not tool_calls:
+            trace_lines.append(f"[assistant — final (declined extension)]\n{textwrap.indent(assistant_content, '  ')}\n")
+            oracle_code = _extract_code(assistant_content)
+        else:
+            trace_lines.append(f"[agent] Extension granted ({_EXTENSION_TURNS} more turns).\n")
+            messages.extend(_run_tool_calls(tool_calls))
+
+            for ext_turn in range(_EXTENSION_TURNS):
+                data = _chat(messages, model, tools)
+                msg  = data.get("message", {})
+                tool_calls        = msg.get("tool_calls") or []
+                thinking          = msg.get("thinking", "") or ""
+                assistant_content = msg.get("content",  "") or ""
+                messages.append({"role": "assistant", "content": assistant_content,
+                                 "tool_calls": tool_calls})
+
+                if thinking:
+                    trace_lines.append(f"[thinking — ext turn {ext_turn + 1}]\n{textwrap.indent(thinking, '  ')}\n")
+
+                if not tool_calls:
+                    trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")
+                    oracle_code = _extract_code(assistant_content)
+                    break
+
+                trace_lines.append(f"[assistant — ext turn {ext_turn + 1}, {len(tool_calls)} tool call(s)]")
+                messages.extend(_run_tool_calls(tool_calls))
+            else:
+                trace_lines.append("[agent] Extension exhausted without final answer.\n")
 
     # Notify about any notes that still need an answer.
     unanswered = _unanswered_notes()

@@ -114,10 +114,11 @@ def generate_one(
 
     if agent:
         oracle_code, trace = generate_with_agent(conn, function_qname, model, oracle_out=oracle_out, verbose=verbose)
+        (oracle_out / "agent_trace.txt").write_text(trace)
         if oracle_code is None:
             return None
         oracle_cc_path.write_text(oracle_code)
-        (oracle_out / "agent_trace.txt").write_text(trace)
+
     else:
         prompt = build_oracle_prompt(conn, function_qname)
         if prompt is None:
