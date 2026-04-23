@@ -365,36 +365,66 @@ def process_file(
     n_funcs = n_calls = n_types = n_type_refs = 0
 
     # ------------------------------------------------------------------
-    # Pass 1: collect function/method declarations and definitions
+    # Pass 1: collect function/method declarations and definitions.
+    # Also harvests free functions defined in included project headers,
+    # which never appear as entries in compile_commands.json themselves.
     # ------------------------------------------------------------------
+    hdr_lines_cache: dict[str, list[str]] = {}
+
     def collect_functions(cursor: clang.cindex.Cursor) -> None:
         nonlocal n_funcs
         loc = cursor.location
-        if not loc.file or loc.file.name != file_path:
+        if not loc.file:
             for child in cursor.get_children():
                 collect_functions(child)
             return
 
+        loc_path   = loc.file.name
+        in_primary = loc_path == file_path
+        in_project = loc_path.startswith(PROJECT_ROOT)
+
+        if not in_primary and not in_project:
+            return  # system / third-party header — skip and don't recurse
+
         if cursor.kind in FUNCTION_KINDS:
             qname = qualified_name(cursor)
             ext   = cursor.extent
-            code  = (
-                slice_source(source_lines, ext.start.line, ext.end.line)
-                if cursor.is_definition() and source_lines
-                else ""
-            )
-            comment = extract_comment(cursor, source_lines)
-            cur = conn.execute(
-                """INSERT INTO functions
-                   (qualified_name, display_name, file_id, line_start, line_end,
-                    kind, is_definition, source_code, comment)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (qname, _method_signature(cursor), file_id,
-                 ext.start.line, ext.end.line,
-                 cursor.kind.name, int(cursor.is_definition()), code, comment),
-            )
-            usr_to_func_id[cursor.get_usr()] = cur.lastrowid
-            n_funcs += 1
+            is_def = cursor.is_definition()
+
+            if in_primary:
+                lines  = source_lines
+                hdr_id = file_id
+            else:
+                if loc_path not in hdr_lines_cache:
+                    hdr_lines_cache[loc_path] = read_lines(loc_path)
+                lines  = hdr_lines_cache[loc_path]
+                hdr_id = get_or_create_file(conn, loc_path)
+
+            code    = slice_source(lines, ext.start.line, ext.end.line) if is_def and lines else ""
+            comment = extract_comment(cursor, lines)
+
+            existing = conn.execute(
+                "SELECT id FROM functions WHERE qualified_name = ? AND line_start = ? LIMIT 1",
+                (qname, ext.start.line),
+            ).fetchone()
+            if existing:
+                func_id = existing[0]
+            else:
+                cur = conn.execute(
+                    """INSERT INTO functions
+                       (qualified_name, display_name, file_id, line_start, line_end,
+                        kind, is_definition, source_code, comment)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (qname, _method_signature(cursor), hdr_id,
+                     ext.start.line, ext.end.line,
+                     cursor.kind.name, int(is_def), code, comment),
+                )
+                func_id = cur.lastrowid
+                n_funcs += 1
+
+            usr = cursor.get_usr()
+            if usr and (usr not in usr_to_func_id or is_def):
+                usr_to_func_id[usr] = func_id
 
         for child in cursor.get_children():
             collect_functions(child)
