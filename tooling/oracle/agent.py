@@ -595,6 +595,18 @@ def generate_with_agent(
     # external library not in the DB, so the agent can't find it via tools.
     user_content += "\n\n// === MMDB USAGE ===\n" + MMDB_MANAGER_SNIPPET
 
+    # Inject callers up-front so the agent sees real usage before reasoning
+    # about unknown parameter types.
+    callers = get_callers_with_source(conn, fn["id"], limit=3)
+    if callers:
+        user_content += "\n\n// === EXAMPLE CALLERS ==="
+        for c in callers:
+            rel = c["file"].replace(PROJECT_ROOT + "/", "")
+            user_content += f"\n\n// {rel}"
+            if c["comment"]:
+                user_content += f"\n// {c['comment']}"
+            user_content += "\n" + c["source_code"].rstrip()
+
     # Load any curated notes (questions + answers) left by previous runs.
     notes_context = _load_notes()
     if notes_context:

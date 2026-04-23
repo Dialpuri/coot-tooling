@@ -260,7 +260,7 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
                 headers[inc] = f"return type {return_type_row['qualified_name']}"
 
     # Callers (example usage)
-    callers = get_callers_with_source(conn, fn["id"], limit=2)
+    callers = get_callers_with_source(conn, fn["id"], limit=3)
 
     # ---- Assemble context block ----
     ctx: list[str] = []
@@ -336,11 +336,6 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
         ctx.append("\n// === MMDB NAVIGATION HIERARCHY ===")
         ctx.append(mmdb_section)
 
-    ctx.append("\n// === FUNCTION TO OBSERVE ===")
-    if fn["comment"]:
-        ctx.append(f"// {fn['comment']}")
-    ctx.append(fn["source_code"] or f"// (no source available) {fn['display_name']}")
-
     if callers:
         ctx.append("\n// === EXAMPLE CALLERS ===")
         for caller in callers:
@@ -349,6 +344,11 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
             if caller["comment"]:
                 ctx.append(f"// {caller['comment']}")
             ctx.append(caller["source_code"].rstrip())
+
+    ctx.append("\n// === FUNCTION TO OBSERVE ===")
+    if fn["comment"]:
+        ctx.append(f"// {fn['comment']}")
+    ctx.append(fn["source_code"] or f"// (no source available) {fn['display_name']}")
 
     context_block = "\n".join(ctx)
 
