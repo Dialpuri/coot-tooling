@@ -12,6 +12,7 @@ oracle so you can audit what the model looked up.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -275,6 +276,67 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_pdb",
+            "description": (
+                "Report what's actually in the test PDB (example.pdb): chain IDs, "
+                "residue ranges per chain, residue types, and a sample of atom names. "
+                "Use this to pick valid inputs (CIDs, chain IDs, residue numbers) "
+                "instead of guessing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {
+                        "type": "string",
+                        "description": "Optional chain ID. If given, lists every residue in that chain.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_base_classes",
+            "description": (
+                "Walk the inheritance chain of a type and list methods declared on each "
+                "base class. Use when a type appears to be missing a method — it may be "
+                "inherited (common with mmdb::Manager → Root, mmdb::Model → Residue, etc.)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Type qualified name, e.g. 'mmdb::Manager'",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_symbol",
+            "description": (
+                "Find the definition of a constant, enum value, macro, or typedef by name. "
+                "Returns the defining line(s) and file. Use when you know a symbol's name "
+                "(e.g. 'SKEY_NEW', 'STYPE_RESIDUE') but not its value or header."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Exact symbol name"},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
 ]
 
 
@@ -500,22 +562,232 @@ def _tool_search_functions(conn: sqlite3.Connection, name_fragment: str) -> str:
     return "\n".join(r[0] for r in rows)
 
 
-def _tool_grep_codebase(pattern: str, glob: str | None = None) -> str:
-    cmd = ["rg", "--line-number", "--with-filename", pattern, PROJECT_ROOT]
-    if glob:
-        cmd += ["--glob", glob]
+_GREP_EXTS = {".cc", ".cpp", ".cxx", ".c", ".h", ".hh", ".hpp", ".hxx"}
+_SKIP_DIRS = {".git", ".claude", "build", "node_modules", "__pycache__", ".venv"}
+
+import shutil as _shutil
+_RG_BIN = _shutil.which("rg")
+
+
+def _grep_files(pattern: str, roots: list[str], glob: str | None, max_matches: int) -> list[str]:
+    """Grep `roots` for `pattern`, preferring ripgrep when available.
+
+    Returns up to max_matches lines formatted as 'path:line:content'.
+    Excludes VCS/build/worktree directories regardless of backend.
+    """
+    if _RG_BIN:
+        cmd = [_RG_BIN, "--line-number", "--with-filename", "--no-heading",
+               "--max-count", str(max_matches), pattern]
+        for d in _SKIP_DIRS:
+            cmd += ["--glob", f"!**/{d}/**"]
+        if glob:
+            cmd += ["--glob", glob]
+        cmd += [r for r in roots if Path(r).is_dir()]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            return ["ERROR: search timed out."]
+        if proc.returncode not in (0, 1):  # 1 = no matches, >1 = error
+            err = (proc.stderr or "").strip().splitlines()[:1]
+            if err:
+                return [f"ERROR: {err[0]}"]
+        return proc.stdout.splitlines()[:max_matches]
+
+    # Python fallback
+    import fnmatch
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except subprocess.TimeoutExpired:
-        return "ERROR: search timed out."
-    output = proc.stdout.strip()
-    if not output:
+        rx = re.compile(pattern)
+    except re.error as e:
+        return [f"ERROR: invalid regex: {e}"]
+    results: list[str] = []
+    for root in roots:
+        root_p = Path(root)
+        if not root_p.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root_p):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for fname in filenames:
+                path = Path(dirpath) / fname
+                if glob:
+                    if not fnmatch.fnmatch(fname, glob):
+                        continue
+                elif path.suffix not in _GREP_EXTS:
+                    continue
+                try:
+                    with path.open(errors="replace") as fh:
+                        for n, line in enumerate(fh, 1):
+                            if rx.search(line):
+                                results.append(f"{path}:{n}:{line.rstrip()}")
+                                if len(results) >= max_matches:
+                                    return results
+                except OSError:
+                    continue
+    return results
+
+
+def _tool_grep_codebase(pattern: str, glob: str | None = None) -> str:
+    MAX = 101
+    matches = _grep_files(pattern, [PROJECT_ROOT], glob, MAX)
+    if not matches:
         return f"No matches for pattern '{pattern}'."
-    lines = output.splitlines()
-    MAX_LINES = 100
-    if len(lines) > MAX_LINES:
-        return "\n".join(lines[:MAX_LINES]) + f"\n... ({len(lines) - MAX_LINES} more matches, refine your pattern)"
-    return output
+    if matches[0].startswith("ERROR:"):
+        return matches[0]
+    if len(matches) >= MAX:
+        return "\n".join(matches[:MAX - 1]) + f"\n... (more matches found, refine your pattern)"
+    return "\n".join(matches)
+
+
+def _tool_inspect_pdb(chain: str | None = None) -> str:
+    """Parse example.pdb and summarise its contents.
+
+    Without 'chain': list chain IDs, residue count, and residue range per chain.
+    With 'chain': list every (seq_num, ins_code, res_name) in that chain plus
+    a sample of atom names.
+    """
+    pdb_path = TEST_DATA_DIR / "example.pdb"
+    if not pdb_path.exists():
+        return f"ERROR: {pdb_path} not found."
+
+    # chain_id -> list[(seq_num, ins_code, res_name, atom_name)]
+    from collections import defaultdict
+    records: dict[str, list[tuple[int, str, str, str]]] = defaultdict(list)
+
+    for line in pdb_path.read_text(errors="replace").splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        try:
+            atom_name = line[12:16].strip()
+            res_name  = line[17:20].strip()
+            chain_id  = line[21:22].strip() or "_"
+            seq_num   = int(line[22:26])
+            ins_code  = line[26:27].strip()
+        except (ValueError, IndexError):
+            continue
+        records[chain_id].append((seq_num, ins_code, res_name, atom_name))
+
+    if not records:
+        return "No ATOM/HETATM records found in example.pdb."
+
+    if chain:
+        rows = records.get(chain)
+        if not rows:
+            return f"Chain '{chain}' not found. Available chains: {sorted(records)}"
+        residues: dict[tuple[int, str], tuple[str, set[str]]] = {}
+        for seq, ins, res, atom in rows:
+            key = (seq, ins)
+            if key not in residues:
+                residues[key] = (res, set())
+            residues[key][1].add(atom)
+        lines = [f"Chain '{chain}' — {len(residues)} residues:"]
+        for (seq, ins), (res, atoms) in sorted(residues.items()):
+            sample = ", ".join(sorted(atoms)[:6])
+            if len(atoms) > 6:
+                sample += f", ... ({len(atoms)} atoms)"
+            ins_str = ins or ""
+            lines.append(f"  {res} {seq}{ins_str}  atoms: {sample}")
+            if len(lines) > 200:
+                lines.append(f"  ... (truncated, {len(residues)} total residues)")
+                break
+        return "\n".join(lines)
+
+    lines = [f"example.pdb — {len(records)} chain(s):"]
+    for cid in sorted(records):
+        rows = records[cid]
+        seqs = sorted({(s, i) for s, i, _, _ in rows})
+        residues_by_id: dict[tuple[int, str], str] = {}
+        for s, i, r, _ in rows:
+            residues_by_id.setdefault((s, i), r)
+        res_types = sorted({r for r in residues_by_id.values()})
+        first, last = seqs[0], seqs[-1]
+        first_str = f"{first[0]}{first[1]}"
+        last_str  = f"{last[0]}{last[1]}"
+        lines.append(
+            f"  chain '{cid}': {len(residues_by_id)} residues, "
+            f"seq {first_str}..{last_str}, types: {', '.join(res_types[:10])}"
+            + (f", ... ({len(res_types)} total)" if len(res_types) > 10 else "")
+        )
+    lines.append("\nCall inspect_pdb(chain='X') to list every residue in a chain.")
+    return "\n".join(lines)
+
+
+def _tool_get_base_classes(conn: sqlite3.Connection, name: str) -> str:
+    """Walk the inheritance chain and list methods on each base class."""
+    _BASE_RE = re.compile(r"^(?:class|struct)\s+\S+\s*:\s*(.+?)\s*\{")
+    _ACCESS_RE = re.compile(r"^(public|protected|private|virtual)\s+")
+
+    def parse_bases(summary: str) -> list[str]:
+        if not summary:
+            return []
+        first = summary.splitlines()[0]
+        m = _BASE_RE.match(first)
+        if not m:
+            return []
+        bases = []
+        for part in m.group(1).split(","):
+            p = part.strip()
+            while _ACCESS_RE.match(p):
+                p = _ACCESS_RE.sub("", p).strip()
+            if p:
+                bases.append(p)
+        return bases
+
+    seen: set[str] = set()
+    out: list[str] = []
+    queue: list[tuple[str, int]] = [(name, 0)]
+
+    while queue:
+        qname, depth = queue.pop(0)
+        if qname in seen or depth > 4:
+            continue
+        seen.add(qname)
+
+        row = get_type(conn, qname)
+        if not row:
+            out.append(f"{'  ' * depth}{qname}  (not in DB)")
+            continue
+
+        resolved = row["qualified_name"]
+        out.append(f"{'  ' * depth}{resolved}  ({row['file']})")
+
+        methods = get_type_methods(conn, resolved)
+        if methods:
+            for m in methods[:15]:
+                comment = f"  // {m['comment']}" if m["comment"] else ""
+                out.append(f"{'  ' * depth}  {m['display_name']}{comment}")
+            if len(methods) > 15:
+                out.append(f"{'  ' * depth}  ... ({len(methods) - 15} more methods)")
+
+        for base in parse_bases(row["summary"] or ""):
+            queue.append((base, depth + 1))
+
+    if len(out) == 1:
+        out.append("  (no base classes found)")
+    return "\n".join(out)
+
+
+def _tool_find_symbol(symbol: str) -> str:
+    """Locate the definition of a constant / enum value / macro / typedef."""
+    if not re.match(r"^\w+$", symbol):
+        return f"ERROR: symbol '{symbol}' must be a plain identifier."
+
+    patterns = [
+        rf"#define\s+{symbol}\b",
+        rf"\b{symbol}\s*=",
+        rf"\btypedef\b[^;]*\b{symbol}\s*;",
+        rf"^\s*{symbol}\s*,?\s*(//.*)?$",
+    ]
+    combined = "|".join(f"(?:{p})" for p in patterns)
+
+    roots = [PROJECT_ROOT] + [r for r in INCLUDE_ROOTS if r != PROJECT_ROOT]
+    MAX = 41
+    matches = _grep_files(combined, roots, glob=None, max_matches=MAX)
+    if not matches:
+        return f"No definition found for '{symbol}'."
+    if matches[0].startswith("ERROR:"):
+        return matches[0]
+    if len(matches) >= MAX:
+        return "\n".join(matches[:MAX - 1]) + f"\n... (more matches)"
+    return "\n".join(matches)
 
 
 def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable]:
@@ -587,6 +859,12 @@ def _dispatch(conn: sqlite3.Connection, name: str, args: dict) -> str:
         return _tool_search_functions(conn, args["name_fragment"])
     if name == "grep_codebase":
         return _tool_grep_codebase(args["pattern"], args.get("glob"))
+    if name == "inspect_pdb":
+        return _tool_inspect_pdb(args.get("chain"))
+    if name == "get_base_classes":
+        return _tool_get_base_classes(conn, args["name"])
+    if name == "find_symbol":
+        return _tool_find_symbol(args["symbol"])
     if name == "leave_note":
         return _tool_leave_note(args["topic"], args["question"])
     return f"Unknown tool: {name}"
@@ -697,6 +975,13 @@ def generate_with_agent(
 
     tools = ORACLE_TOOLS if oracle_out else TOOLS
     oracle_code: str | None = None
+    last_draft: list[str | None] = [None]    # any cpp draft we've ever seen (fallback)
+    call_counts: dict[str, int] = {}         # repeat-call detection
+    REPEAT_LIMIT = 3
+
+    def _save_draft(code: str) -> None:
+        if code and len(code) > 100 and "#include" in code:
+            last_draft[0] = code
 
     def _run_tool_calls(tool_calls: list, label: str = "") -> list[dict]:
         results: list[dict] = []
@@ -709,6 +994,28 @@ def generate_with_agent(
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
+
+            # Snapshot drafts — any code passed to compile_oracle is worth keeping.
+            if name == "compile_oracle" and isinstance(args.get("code"), str):
+                _save_draft(args["code"])
+
+            # Repeat-call detection: hash on (name, non-code args) so compile
+            # attempts with different code aren't counted as repeats.
+            hash_args = {k: v for k, v in args.items() if k != "code"}
+            key = f"{name}:{json.dumps(hash_args, sort_keys=True)}"
+            call_counts[key] = call_counts.get(key, 0) + 1
+
+            if call_counts[key] > REPEAT_LIMIT and name not in ("compile_oracle", "run_oracle"):
+                nudge = (
+                    f"You have already called {name} with these arguments "
+                    f"{call_counts[key]} times. Stop repeating — use the information "
+                    "you already have. Draft oracle.cc and call compile_oracle now."
+                )
+                trace_lines.append(f"  → [repeat-intercept × {call_counts[key]}] {name}({json.dumps(hash_args)})")
+                trace_lines.append(textwrap.indent(nudge, "      ") + "\n")
+                results.append({"role": "tool", "content": nudge})
+                continue
+
             if verbose:
                 print(f"  tool: {name}({args})")
             result = dispatch(name, args)
@@ -722,7 +1029,9 @@ def generate_with_agent(
 
     def _extract_code(content: str) -> str:
         m = re.search(r"```(?:cpp|c\+\+)?\n(.*?)```", content, re.DOTALL)
-        return m.group(1).strip() if m else content.strip()
+        code = m.group(1).strip() if m else content.strip()
+        _save_draft(code)
+        return code
 
     for turn in range(20):
         data = _chat(messages, model, tools)
@@ -791,6 +1100,35 @@ def generate_with_agent(
                 messages.extend(_run_tool_calls(tool_calls))
             else:
                 trace_lines.append("[agent] Extension exhausted without final answer.\n")
+
+    # ── Rescue: recover a draft if the final turn produced nothing usable ────
+    def _is_usable(code: str | None) -> bool:
+        return bool(code and len(code) > 100 and "#include" in code)
+
+    if not _is_usable(oracle_code):
+        if _is_usable(last_draft[0]):
+            trace_lines.append("[rescue] final turn had no code block — reusing last seen draft.\n")
+            oracle_code = last_draft[0]
+        else:
+            trace_lines.append("[rescue] no draft found — one-shot asking for final output.\n")
+            messages.append({"role": "user", "content": (
+                "STOP. Do not call any tools. Output your best attempt at oracle.cc "
+                "NOW inside a single ```cpp block. This is your last chance — "
+                "partial or imperfect code is better than nothing."
+            )})
+            try:
+                data = _chat(messages, model, tools=[])
+                assistant_content = (data.get("message") or {}).get("content") or ""
+                trace_lines.append(f"[rescue — response]\n{textwrap.indent(assistant_content, '  ')}\n")
+                rescued = _extract_code(assistant_content)
+                if _is_usable(rescued):
+                    oracle_code = rescued
+                elif _is_usable(last_draft[0]):
+                    oracle_code = last_draft[0]
+            except (urllib.error.URLError, json.JSONDecodeError) as e:
+                trace_lines.append(f"[rescue] failed: {e}\n")
+                if _is_usable(last_draft[0]):
+                    oracle_code = last_draft[0]
 
     # Notify about any notes that still need an answer.
     unanswered = _unanswered_notes()

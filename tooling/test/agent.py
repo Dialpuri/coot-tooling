@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import textwrap
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -246,6 +247,13 @@ def generate_test_with_agent(
     ]
 
     test_code: str | None = None
+    last_draft: list[str | None] = [None]
+    call_counts: dict[str, int] = {}
+    REPEAT_LIMIT = 3
+
+    def _save_draft(code: str) -> None:
+        if code and len(code) > 100 and "#include" in code:
+            last_draft[0] = code
 
     def _run_tool_calls(tool_calls: list[dict]) -> list[dict]:
         results: list[dict] = []
@@ -258,6 +266,20 @@ def generate_test_with_agent(
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
+            if name == "compile_test" and isinstance(args.get("code"), str):
+                _save_draft(args["code"])
+            hash_args = {k: v for k, v in args.items() if k != "code"}
+            key = f"{name}:{json.dumps(hash_args, sort_keys=True)}"
+            call_counts[key] = call_counts.get(key, 0) + 1
+            if call_counts[key] > REPEAT_LIMIT and name not in ("compile_test", "run_test"):
+                nudge = (
+                    f"You have called {name} with these arguments {call_counts[key]} times. "
+                    "Stop repeating — use the information you already have and proceed to "
+                    "compile_test with your best draft."
+                )
+                trace_lines.append(f"  → {name}(repeated — nudged)")
+                results.append({"role": "tool", "content": nudge})
+                continue
             if verbose:
                 display = {"code": "..."} if name == "compile_test" else args
                 print(f"  tool: {name}({display})")
@@ -277,7 +299,12 @@ def generate_test_with_agent(
 
     def _extract_code(content: str) -> str:
         m = re.search(r"```(?:cpp|c\+\+)?\n(.*?)```", content, re.DOTALL)
-        return m.group(1).strip() if m else content.strip()
+        code = m.group(1).strip() if m else content.strip()
+        _save_draft(code)
+        return code
+
+    def _is_usable(code: str | None) -> bool:
+        return bool(code and len(code) > 100 and "#include" in code)
 
     for turn in range(20):
         data = _chat(messages, model, TEST_TOOLS)
@@ -364,5 +391,32 @@ def generate_test_with_agent(
                 messages.extend(_run_tool_calls(tool_calls))
             else:
                 trace_lines.append("[agent] Extension exhausted without final answer.\n")
+
+    if not _is_usable(test_code):
+        if _is_usable(last_draft[0]):
+            trace_lines.append("[agent] Falling back to last saved draft.\n")
+            test_code = last_draft[0]
+        else:
+            trace_lines.append("[agent] No usable output — issuing rescue prompt.\n")
+            messages.append({"role": "user", "content": (
+                "STOP. Do not call any tools. Output your best attempt at test.cc "
+                "NOW inside a single ```cpp block. This is your last chance — any "
+                "plausible draft is better than no output."
+            )})
+            try:
+                data = _chat(messages, model, tools=[])
+                assistant_content = (data.get("message") or {}).get("content") or ""
+                trace_lines.append(
+                    f"[assistant — rescue]\n{textwrap.indent(assistant_content, '  ')}\n"
+                )
+                rescued = _extract_code(assistant_content)
+                if _is_usable(rescued):
+                    test_code = rescued
+                elif _is_usable(last_draft[0]):
+                    test_code = last_draft[0]
+            except (urllib.error.URLError, json.JSONDecodeError) as e:
+                trace_lines.append(f"[agent] Rescue call failed: {e}\n")
+                if _is_usable(last_draft[0]):
+                    test_code = last_draft[0]
 
     return test_code, "\n".join(trace_lines)
