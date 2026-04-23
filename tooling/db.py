@@ -86,15 +86,33 @@ def get_type_methods(conn: sqlite3.Connection, type_qname: str) -> list[sqlite3.
     """, (f"{type_qname}::%",)).fetchall()
 
 
-def get_class_functions(conn: sqlite3.Connection, class_qname: str) -> list[str]:
-    """Return qualified names of all methods in a class (definitions preferred, declarations as fallback)."""
-    rows = conn.execute("""
-        SELECT DISTINCT qualified_name
-        FROM functions
-        WHERE qualified_name LIKE ?
-          AND kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR', 'FUNCTION_TEMPLATE')
-        ORDER BY line_start
-    """, (f"{class_qname}::%",)).fetchall()
+def get_class_functions(
+    conn: sqlite3.Connection,
+    class_qname: str,
+    mmdb_only: bool = False,
+) -> list[str]:
+    """Return qualified names of all methods in a class (definitions preferred, declarations as fallback).
+
+    If mmdb_only is True, only return methods that use at least one mmdb:: type.
+    """
+    if mmdb_only:
+        rows = conn.execute("""
+            SELECT DISTINCT f.qualified_name
+            FROM functions f
+            JOIN uses_type u ON u.function_id = f.id
+            WHERE f.qualified_name LIKE ?
+              AND f.kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR', 'FUNCTION_TEMPLATE', 'FUNCTION_DECL')
+              AND u.type_qualified_name LIKE 'mmdb::%'
+            ORDER BY f.line_start
+        """, (f"{class_qname}::%",)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT DISTINCT qualified_name
+            FROM functions
+            WHERE qualified_name LIKE ?
+              AND kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR', 'FUNCTION_TEMPLATE', 'FUNCTION_DECL')
+            ORDER BY line_start
+        """, (f"{class_qname}::%",)).fetchall()
     return [r[0] for r in rows]
 
 
