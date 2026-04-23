@@ -19,6 +19,28 @@ from ..db import (
     PROJECT_ROOT,
 )
 
+
+def caller_class_fields(conn: sqlite3.Connection, caller_qname: str) -> str | None:
+    """Return a terse field listing for the class that contains caller_qname.
+
+    Only field declarations are included (no methods, no structural lines) so
+    the agent can resolve unknown variables like `geom` or `molecules[imol]`
+    without being swamped by the full class definition.
+    Returns None if the caller has no containing class or the class has no fields.
+    """
+    cls = get_containing_class(conn, caller_qname)
+    if not cls or not cls["summary"]:
+        return None
+    fields = [
+        line for line in cls["summary"].splitlines()
+        if line.strip()
+        and "(" not in line
+        and not line.strip().startswith(("class ", "struct ", "};"))
+    ]
+    if not fields:
+        return None
+    return f"// Fields of {cls['qualified_name']}:\n" + "\n".join(fields)
+
 # mmdb::Manager key methods are inherited from mmdb::Root / mmdb::CoorMngrRoot
 # and don't appear on Manager directly, so we use a hardcoded setup pattern.
 MMDB_MANAGER_SNIPPET = """\
@@ -343,6 +365,9 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
             ctx.append(f"\n// {rel}")
             if caller["comment"]:
                 ctx.append(f"// {caller['comment']}")
+            fields = caller_class_fields(conn, caller["qualified_name"])
+            if fields:
+                ctx.append(fields)
             ctx.append(caller["source_code"].rstrip())
 
     ctx.append("\n// === FUNCTION TO OBSERVE ===")
