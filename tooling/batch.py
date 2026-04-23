@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+Full pipeline: generate oracles then tests for all methods in a class.
+
+Usage:
+  # Oracle + test for every method in coot::molecule_t
+  python -m tooling.batch "coot::molecule_t"
+
+  # Agentic oracle + agentic test, filtered to methods containing "cid"
+  python -m tooling.batch "coot::molecule_t" --agent --filter cid
+
+  # Skip oracle generation if oracle.cc already exists, only (re)generate tests
+  python -m tooling.batch "coot::molecule_t" --skip-oracle
+
+  # Parallel workers (each worker runs its own Ollama request)
+  python -m tooling.batch "coot::molecule_t" --workers 4
+
+  # List matching methods without generating anything
+  python -m tooling.batch "coot::molecule_t" --list
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from .db import connect, get_class_functions
+from .oracle.generate import DEFAULT_MODEL, OUT_ROOT, generate_one, sanitize_name
+from .test.generate import generate_test
+
+
+# ── result tracking ───────────────────────────────────────────────────────────
+
+class Result:
+    def __init__(self, qname: str):
+        self.qname      = qname
+        self.skipped    = False
+        self.oracle_ok: bool | None = None
+        self.test_ok:   bool | None = None
+        self.error:     str  | None = None
+
+    @property
+    def short(self) -> str:
+        return self.qname.rsplit("::", 1)[-1]
+
+
+# ── per-function worker ───────────────────────────────────────────────────────
+
+def _process(
+    qname: str,
+    model: str,
+    agent: bool,
+    verbose: bool,
+    skip_oracle: bool,
+    skip_existing: bool,
+) -> Result:
+    r = Result(qname)
+    out_dir = OUT_ROOT / sanitize_name(qname)
+    oracle_cc = out_dir / "oracle" / "oracle.cc"
+
+    # ── oracle phase ──────────────────────────────────────────────────────────
+    if skip_oracle and oracle_cc.exists():
+        r.oracle_ok = True  # treat pre-existing oracle as success
+    elif skip_existing and oracle_cc.exists():
+        r.skipped = True
+        return r
+    else:
+        conn = connect()
+        try:
+            result_dir = generate_one(
+                conn, qname, model=model, agent=agent, verbose=verbose,
+            )
+        except urllib.error.URLError as e:
+            r.error = f"Ollama unreachable: {e}"
+            return r
+        finally:
+            conn.close()
+
+        if result_dir is None:
+            r.error = "not found in DB"
+            return r
+
+        r.oracle_ok = True
+
+    # ── test phase ────────────────────────────────────────────────────────────
+    try:
+        generate_test(
+            out_dir, model=model, agent=agent, verbose=verbose,
+        )
+        r.test_ok = True
+    except Exception as e:
+        r.test_ok = False
+        r.error = f"test generation failed: {e}"
+
+    return r
+
+
+# ── summary ───────────────────────────────────────────────────────────────────
+
+def _print_summary(results: list[Result]) -> None:
+    sym = {True: "✓", False: "✗", None: " "}
+    skip_sym = "–"
+
+    header = f"{'method':<50}  oracle  test"
+    print("\n" + header)
+    print("-" * len(header))
+
+    ok = fail = skip = 0
+    for r in sorted(results, key=lambda r: r.qname):
+        if r.skipped:
+            skip += 1
+            print(f"{r.short:<50}  {skip_sym}")
+            continue
+
+        row = f"{r.short:<50}  {sym[r.oracle_ok]}       {sym[r.test_ok]}"
+        if r.error:
+            row += f"  ← {r.error.splitlines()[0]}"
+        print(row)
+
+        if r.oracle_ok and r.test_ok:
+            ok += 1
+        else:
+            fail += 1
+
+    print(f"\n{ok} ok  {fail} failed  {skip} skipped  ({len(results)} total)")
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate oracles + Google Tests for all methods in a class",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("class_name", help="Fully-qualified class name, e.g. coot::molecule_t")
+    parser.add_argument("--filter",        metavar="STR",  help="Only process methods whose name contains STR")
+    parser.add_argument("--mmdb-only",     action="store_true", help="Only process methods that use MMDB types (mmdb::*)")
+    parser.add_argument("--model",         default=DEFAULT_MODEL)
+    parser.add_argument("--agent",         action="store_true",  help="Agentic mode for both oracle and test generation")
+    parser.add_argument("--verbose",       action="store_true", help="Print thinking and tool calls to console")
+    parser.add_argument("--skip-oracle",   action="store_true", help="Skip oracle generation if oracle.cc already exists; go straight to test generation")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip methods that already have oracle.cc")
+    parser.add_argument("--workers",       type=int, default=1, metavar="N",
+                        help="Parallel workers (default 1)")
+    parser.add_argument("--list",          action="store_true", help="List matching methods and exit")
+    args = parser.parse_args()
+
+    conn = connect()
+    qnames = get_class_functions(conn, args.class_name, mmdb_only=args.mmdb_only)
+    conn.close()
+
+    if not qnames:
+        print(f"No methods found for class: {args.class_name}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.filter:
+        qnames = [q for q in qnames if args.filter in q]
+        if not qnames:
+            print(f"No methods match filter '{args.filter}'", file=sys.stderr)
+            sys.exit(1)
+
+    if args.list:
+        for q in qnames:
+            print(q)
+        print(f"\n{len(qnames)} methods")
+        return
+
+    print(f"Processing {len(qnames)} methods from {args.class_name} "
+          f"(model={args.model}, workers={args.workers}, agent={args.agent})")
+
+    results: list[Result] = []
+
+    if args.workers == 1:
+        for i, qname in enumerate(qnames, 1):
+            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]} ...", end=" ", flush=True)
+            r = _process(qname, args.model, args.agent, args.verbose,
+                         args.skip_oracle, args.skip_existing)
+            results.append(r)
+            if r.skipped:
+                print("skipped")
+            elif r.error:
+                print(f"FAILED — {r.error.splitlines()[0]}")
+            else:
+                print("ok")
+    else:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for qname in qnames:
+                f = pool.submit(_process, qname, args.model, args.agent,
+                                args.verbose, args.skip_oracle, args.skip_existing)
+                futures[f] = qname
+            for f in as_completed(futures):
+                r = f.result()
+                results.append(r)
+                status = "skipped" if r.skipped else ("ok" if not r.error else "FAILED")
+                print(f"  {r.short}: {status}")
+
+    _print_summary(results)
+    if any(not r.skipped and (not r.oracle_ok or not r.test_ok) for r in results):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
