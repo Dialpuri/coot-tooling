@@ -28,7 +28,7 @@ from ..db import (
     get_callers_with_source,
     get_class_functions,
 )
-from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNIPPET
+from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNIPPET, caller_class_fields
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 
@@ -245,6 +245,33 @@ TOOLS: list[dict] = [
                     "name_fragment": {"type": "string"},
                 },
                 "required": ["name_fragment"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_codebase",
+            "description": (
+                "Search the coot source tree for a regex pattern. "
+                "Returns matching lines with file path and line number. "
+                "Use this to find how a type or variable is used, locate a definition, "
+                "or discover valid values for a parameter. "
+                "Optionally restrict to files matching a glob (e.g. '*.hh', '*.cc')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Restrict search to files matching this glob, e.g. '*.hh'",
+                    },
+                },
+                "required": ["pattern"],
             },
         },
     },
@@ -473,6 +500,24 @@ def _tool_search_functions(conn: sqlite3.Connection, name_fragment: str) -> str:
     return "\n".join(r[0] for r in rows)
 
 
+def _tool_grep_codebase(pattern: str, glob: str | None = None) -> str:
+    cmd = ["rg", "--line-number", "--with-filename", pattern, PROJECT_ROOT]
+    if glob:
+        cmd += ["--glob", glob]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return "ERROR: search timed out."
+    output = proc.stdout.strip()
+    if not output:
+        return f"No matches for pattern '{pattern}'."
+    lines = output.splitlines()
+    MAX_LINES = 100
+    if len(lines) > MAX_LINES:
+        return "\n".join(lines[:MAX_LINES]) + f"\n... ({len(lines) - MAX_LINES} more matches, refine your pattern)"
+    return output
+
+
 def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable]:
     """Return (compile_handler, run_handler) for the oracle agent loop."""
     from .compile import write_compile_script
@@ -540,6 +585,8 @@ def _dispatch(conn: sqlite3.Connection, name: str, args: dict) -> str:
         return _tool_resolve_includes(args["code"])
     if name == "search_functions":
         return _tool_search_functions(conn, args["name_fragment"])
+    if name == "grep_codebase":
+        return _tool_grep_codebase(args["pattern"], args.get("glob"))
     if name == "leave_note":
         return _tool_leave_note(args["topic"], args["question"])
     return f"Unknown tool: {name}"
@@ -605,6 +652,9 @@ def generate_with_agent(
             user_content += f"\n\n// {rel}"
             if c["comment"]:
                 user_content += f"\n// {c['comment']}"
+            fields = caller_class_fields(conn, c["qualified_name"])
+            if fields:
+                user_content += "\n" + fields
             user_content += "\n" + c["source_code"].rstrip()
 
     # Load any curated notes (questions + answers) left by previous runs.
