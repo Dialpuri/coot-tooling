@@ -13,7 +13,9 @@ from pathlib import Path
 from ..oracle.agent import (
     OLLAMA_CHAT_URL, TOOLS, _dispatch,
     _EXTENSION_TURNS, _MAX_EXTENSIONS, _EXTENSION_PROMPT,
+    _tool_resolve_includes, _has_unresolved_includes,
 )
+from ..oracle.notes import load_notes, render_notes_for_prompt
 from ..oracle.runner.results import OracleResult
 from .compile import MAX_COMPILE_ATTEMPTS, compile_test_cc, run_test_binary
 
@@ -115,6 +117,17 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
                 f"Compile limit reached ({MAX_COMPILE_ATTEMPTS} attempts). "
                 "Output your best draft as the final ```cpp block."
             )
+
+        # Pre-flight include check — free fix cycle on WRONG/MISSING paths.
+        include_report = _tool_resolve_includes(code)
+        if _has_unresolved_includes(include_report):
+            return (
+                "Include check FAILED (this does not count against your "
+                f"{MAX_COMPILE_ATTEMPTS} compile attempts). Fix the paths "
+                "below and call compile_test again:\n"
+                + include_report
+            )
+
         attempts[0] += 1
 
         test_subdir.mkdir(exist_ok=True)
@@ -227,10 +240,22 @@ def generate_test_with_agent(
             if len(tool_lines) > 20:
                 trace_summary += f"\n  ... ({len(tool_lines) - 20} more)"
 
+    # Oracle-derived notes, if the oracle stage produced any.
+    notes_block = ""
+    notes = load_notes(test_subdir.parent / "oracle" / "notes.json")
+    if notes:
+        rendered = render_notes_for_prompt(notes, audience="test")
+        if rendered:
+            notes_block = (
+                "\n\nOracle stage recorded these validated facts — reuse them:\n"
+                + rendered + "\n"
+            )
+
     user_content = (
         f"Here is the oracle program:\n\n```cpp\n{oracle_cc_text}\n```\n\n"
         + cases_text
         + trace_summary
+        + notes_block
         + "\n\nConvert this into a Google Test suite. Use the tools to verify "
         "headers, look up any types you are unsure about, then compile and run "
         "before finalising."

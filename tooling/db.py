@@ -139,6 +139,32 @@ def get_constructor_callers(
     """, (ctor_qname, limit)).fetchall()
 
 
+def get_internal_call_deps(
+    conn: sqlite3.Connection, qnames: list[str],
+) -> dict[str, set[str]]:
+    """For every qname in the batch, return the subset of qnames it calls
+    that are ALSO in the batch. Self-calls (direct recursion) are ignored.
+
+    Result shape: {caller_qname: {callee_qname, ...}}.
+    Every input qname is present as a key, possibly with an empty set.
+    """
+    if not qnames:
+        return {}
+    placeholders = ",".join("?" * len(qnames))
+    rows = conn.execute(f"""
+        SELECT DISTINCT f.qualified_name, c.callee_qualified_name
+        FROM calls c
+        JOIN functions f ON f.id = c.caller_id
+        WHERE f.qualified_name IN ({placeholders})
+          AND c.callee_qualified_name IN ({placeholders})
+    """, (*qnames, *qnames)).fetchall()
+    deps: dict[str, set[str]] = {q: set() for q in qnames}
+    for caller, callee in rows:
+        if caller != callee:
+            deps[caller].add(callee)
+    return deps
+
+
 def get_callers_with_source(
     conn: sqlite3.Connection,
     function_id: int,

@@ -24,6 +24,7 @@ from ..db import connect
 from .render import build_oracle_prompt
 from .agent import generate_with_agent
 from .compile import write_compile_script, compile_oracle
+from .notes import extract_oracle_notes, save_notes
 
 OLLAMA_URL    = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "qwen3.6"
@@ -139,6 +140,17 @@ def generate_one(
 
     result = run_oracle(oracle_out)
     print(result.summary())
+
+    # Extract structured notes from the working oracle for downstream stages.
+    # Best-effort: a failure here should not fail oracle generation.
+    if result.success:
+        try:
+            notes = extract_oracle_notes(oracle_code, function_qname, model)
+            if notes:
+                save_notes(notes, oracle_out / "notes.json")
+        except Exception as e:
+            print(f"[notes] extraction skipped: {e}")
+
     return out_dir
 
 

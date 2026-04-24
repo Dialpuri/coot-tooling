@@ -26,7 +26,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .db import connect, get_class_functions
+from .db import connect, get_class_functions, get_internal_call_deps
 from .oracle.generate import DEFAULT_MODEL, OUT_ROOT, generate_one, sanitize_name
 from .test.generate import generate_test
 from .gemmi.generate import generate_gemmi
@@ -46,6 +46,28 @@ class Result:
     @property
     def short(self) -> str:
         return self.qname.rsplit("::", 1)[-1]
+
+
+# ── dependency ordering ───────────────────────────────────────────────────────
+
+def topo_order(deps: dict[str, set[str]]) -> list[str]:
+    """Return qnames in bottom-up call order: callees (inside the batch)
+    come before their callers. On cycles, break by picking the node with
+    the fewest outstanding in-batch deps (deterministic tie-break: qname).
+    """
+    remaining = {q: set(d) for q, d in deps.items()}
+    order: list[str] = []
+    while remaining:
+        ready = sorted(q for q, d in remaining.items() if not d)
+        if not ready:
+            pick = min(remaining, key=lambda q: (len(remaining[q]), q))
+            ready = [pick]
+        for q in ready:
+            order.append(q)
+            del remaining[q]
+        for d in remaining.values():
+            d.difference_update(ready)
+    return order
 
 
 # ── per-function worker ───────────────────────────────────────────────────────
@@ -163,6 +185,10 @@ def main() -> None:
     parser.add_argument("--skip-existing", action="store_true", help="Skip methods that already have oracle.cc")
     parser.add_argument("--with-gemmi",    action="store_true",
                         help="After test succeeds, also run the combined gemmi port + test stage")
+    parser.add_argument("--no-topo",       action="store_true",
+                        help="Disable bottom-up call-graph ordering (default is enabled: "
+                             "functions with no in-batch callees go first, so any callees "
+                             "are already converted by the time their callers are processed)")
     parser.add_argument("--workers",       type=int, default=1, metavar="N",
                         help="Parallel workers (default 1)")
     parser.add_argument("--list",          action="store_true", help="List matching methods and exit")
@@ -181,6 +207,21 @@ def main() -> None:
         if not qnames:
             print(f"No methods match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
+
+    # Bottom-up topological ordering: callees before callers. Skipped in
+    # parallel mode because dependencies can't be enforced once workers run
+    # concurrently — use --workers 1 to keep the guarantee.
+    if not args.no_topo:
+        if args.workers > 1:
+            print("[warn] --workers > 1 disables call-graph ordering; "
+                  "pass --no-topo to silence this.", file=sys.stderr)
+        else:
+            conn = connect()
+            try:
+                deps = get_internal_call_deps(conn, qnames)
+            finally:
+                conn.close()
+            qnames = topo_order(deps)
 
     if args.list:
         for q in qnames:

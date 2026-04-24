@@ -410,9 +410,17 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
 
     if callers:
         ctx.append("\n// === EXAMPLE CALLERS ===")
+        target_class = containing_class["qualified_name"] if containing_class else None
         for caller in callers:
             rel = caller["file"].replace(PROJECT_ROOT + "/", "")
-            ctx.append(f"\n// {rel}")
+            caller_cls = get_containing_class(conn, caller["qualified_name"])
+            caller_cls_qname = caller_cls["qualified_name"] if caller_cls else None
+            in_class = (
+                target_class is not None
+                and caller_cls_qname == target_class
+            )
+            tag = " [in-class caller — has private access, oracle does NOT]" if in_class else ""
+            ctx.append(f"\n// {rel}{tag}")
             if caller["comment"]:
                 ctx.append(f"// {caller['comment']}")
             fields = caller_class_fields(conn, caller["qualified_name"])

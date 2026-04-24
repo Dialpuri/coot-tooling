@@ -20,7 +20,9 @@ from pathlib import Path
 from ..oracle.agent import (
     OLLAMA_CHAT_URL, TOOLS, _dispatch,
     _EXTENSION_TURNS, _MAX_EXTENSIONS, _EXTENSION_PROMPT,
+    _tool_resolve_includes, _has_unresolved_includes,
 )
+from ..oracle.notes import load_notes, render_notes_for_prompt
 from .compile import MAX_COMPILE_ATTEMPTS, compile_gemmi, run_gemmi_test_binary
 
 GEMMI_SYSTEM_PROMPT = """\
@@ -120,6 +122,25 @@ def _make_tool_handlers(gemmi_subdir: Path) -> tuple[callable, callable, callabl
         if attempts[0] >= MAX_COMPILE_ATTEMPTS:
             return (f"Compile limit reached ({MAX_COMPILE_ATTEMPTS}). "
                     "Output your best drafts as the final fenced blocks.")
+
+        # Pre-flight include check across all three files — free fix cycle.
+        sections: list[str] = []
+        for label, body in (("function.hh", function_hh),
+                            ("function.cc", function_cc),
+                            ("test.cc",     test_cc)):
+            if not body:
+                continue
+            report = _tool_resolve_includes(body)
+            if _has_unresolved_includes(report):
+                sections.append(f"--- {label} ---\n{report}")
+        if sections:
+            return (
+                "Include check FAILED (this does not count against your "
+                f"{MAX_COMPILE_ATTEMPTS} compile attempts). Fix the paths "
+                "below and call compile_gemmi again:\n"
+                + "\n\n".join(sections)
+            )
+
         attempts[0] += 1
         gemmi_subdir.mkdir(exist_ok=True)
 
@@ -237,13 +258,25 @@ def generate_gemmi_port_with_agent(
             return get_errors_handler()
         return _dispatch(conn, name, args)
 
+    notes_block = ""
+    notes = load_notes(gemmi_subdir.parent / "oracle" / "notes.json")
+    if notes:
+        rendered = render_notes_for_prompt(notes, audience="gemmi")
+        if rendered:
+            notes_block = (
+                "\n\nOracle stage recorded these validated facts — carry them "
+                "over where they still apply, and treat the port caveats as "
+                "concrete design hints:\n" + rendered + "\n"
+            )
+
     user_content = (
         f"Port `{function_qname}` to gemmi AND translate its MMDB test in one "
         "pass.\n\n"
         f"Original MMDB function:\n```cpp\n{original_function_src}\n```\n\n"
         f"Original MMDB test (FREEZE every EXPECT_*):\n"
-        f"```cpp\n{original_test_cc}\n```\n\n"
-        "Design the gemmi function signature and the test's call site "
+        f"```cpp\n{original_test_cc}\n```"
+        + notes_block
+        + "\n\nDesign the gemmi function signature and the test's call site "
         "together. Use the tools to resolve gemmi types. Compile and run "
         "before finalising."
     )

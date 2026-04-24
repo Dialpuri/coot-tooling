@@ -506,13 +506,23 @@ def _unanswered_notes() -> list[Path]:
     return unanswered
 
 
+_INCLUDE_RE = re.compile(r'#include\s+([<"])([^">]+)[">]')
+
+
+def _fmt_include(path: str, delim: str) -> str:
+    return f'#include "{path}"' if delim == '"' else f'#include <{path}>'
+
+
 def _tool_resolve_includes(code: str) -> str:
-    includes = re.findall(r'#include\s+"([^"]+)"', code)
+    """Verify every #include in `code`. Covers both "..." and <...> forms."""
+    includes = _INCLUDE_RE.findall(code)
     if not includes:
-        return "No local #include \"...\" directives found in the supplied code."
+        return "No #include directives found in the supplied code."
 
     lines: list[str] = []
-    for inc in includes:
+    for delim, inc in includes:
+        shown = _fmt_include(inc, delim)
+
         # Try resolving from each allowed root directly.
         found_at: list[str] = []
         for root in ALLOWED_READ_ROOTS:
@@ -521,7 +531,7 @@ def _tool_resolve_includes(code: str) -> str:
                 found_at.append(str(candidate))
 
         if found_at:
-            lines.append(f'OK  #include "{inc}"  →  {found_at[0]}')
+            lines.append(f'OK  {shown}  →  {found_at[0]}')
             continue
 
         # Not found at the given path — search by filename across the tree.
@@ -532,16 +542,15 @@ def _tool_resolve_includes(code: str) -> str:
         matches = sorted(set(matches))[:5]
 
         if not matches:
-            lines.append(f'MISSING  #include "{inc}"  (no file named {filename!r} found in source tree)')
+            lines.append(f'MISSING  {shown}  (no file named {filename!r} found in source tree)')
             continue
 
-        lines.append(f'WRONG PATH  #include "{inc}"')
+        lines.append(f'WRONG PATH  {shown}')
         for m in matches:
-            # Express as a path relative to the first root that contains it.
             for root in ALLOWED_READ_ROOTS:
                 try:
                     rel = m.relative_to(root)
-                    lines.append(f'  use instead:  #include "{rel}"  (at {m})')
+                    lines.append(f'  use instead:  {_fmt_include(str(rel), delim)}  (at {m})')
                     break
                 except ValueError:
                     continue
@@ -549,6 +558,10 @@ def _tool_resolve_includes(code: str) -> str:
                 lines.append(f'  found at:  {m}  (no standard include root covers this)')
 
     return "\n".join(lines)
+
+
+def _has_unresolved_includes(report: str) -> bool:
+    return any(line.startswith(("WRONG PATH", "MISSING")) for line in report.splitlines())
 
 
 def _tool_search_functions(conn: sqlite3.Connection, name_fragment: str) -> str:
@@ -803,6 +816,19 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable]:
                 f"Compile limit reached ({_MAX_COMPILE_ATTEMPTS} attempts). "
                 "Output your best draft as the final ```cpp block."
             )
+
+        # Pre-flight: verify every #include before spending a compile attempt.
+        # If any are WRONG PATH / MISSING, return the report and do NOT count
+        # this as an attempt — the agent gets a free fix cycle.
+        include_report = _tool_resolve_includes(code)
+        if _has_unresolved_includes(include_report):
+            return (
+                "Include check FAILED (this does not count against your "
+                f"{_MAX_COMPILE_ATTEMPTS} compile attempts). Fix the paths "
+                "below and call compile_oracle again:\n"
+                + include_report
+            )
+
         attempts[0] += 1
         oracle_out.mkdir(parents=True, exist_ok=True)
         oracle_cc = oracle_out / "oracle.cc"
