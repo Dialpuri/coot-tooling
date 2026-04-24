@@ -955,6 +955,13 @@ def generate_with_agent(
         {"role": "user",   "content": user_content},
     ]
 
+    if oracle_out is not None:
+        oracle_out.mkdir(parents=True, exist_ok=True)
+        (oracle_out / "prompt.txt").write_text(
+            f"=== SYSTEM ===\n{AGENT_SYSTEM_PROMPT}\n\n"
+            f"=== USER ===\n{user_content}\n"
+        )
+
     trace_lines: list[str] = [
         f"=== AGENT TRACE: {function_qname} ===\n",
         f"[user]\n{textwrap.indent(user_content, '  ')}\n",

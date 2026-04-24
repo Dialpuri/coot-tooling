@@ -241,6 +241,12 @@ def generate_test_with_agent(
         {"role": "user",   "content": user_content},
     ]
 
+    test_subdir.mkdir(parents=True, exist_ok=True)
+    (test_subdir / "prompt.txt").write_text(
+        f"=== SYSTEM ===\n{TEST_SYSTEM_PROMPT}\n\n"
+        f"=== USER ===\n{user_content}\n"
+    )
+
     trace_lines: list[str] = [
         "=== TEST AGENT TRACE ===\n",
         f"[user]\n{textwrap.indent(user_content, '  ')}\n",

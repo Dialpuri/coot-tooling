@@ -252,6 +252,13 @@ def generate_gemmi_port_with_agent(
         {"role": "system", "content": GEMMI_SYSTEM_PROMPT},
         {"role": "user",   "content": user_content},
     ]
+
+    gemmi_subdir.mkdir(parents=True, exist_ok=True)
+    (gemmi_subdir / "prompt.txt").write_text(
+        f"=== SYSTEM ===\n{GEMMI_SYSTEM_PROMPT}\n\n"
+        f"=== USER ===\n{user_content}\n"
+    )
+
     trace_lines: list[str] = [
         "=== GEMMI COMBINED AGENT TRACE ===\n",
         f"[user]\n{textwrap.indent(user_content, '  ')}\n",
