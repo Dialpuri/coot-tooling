@@ -49,7 +49,20 @@ VAR_SUBS = {
 
 clang.cindex.Config.set_library_file(LIBCLANG)
 
-_ck = clang.cindex.CursorKind
+_ck  = clang.cindex.CursorKind
+_acc = clang.cindex.AccessSpecifier
+
+_ACCESS_NAMES = {
+    _acc.PUBLIC:    "public",
+    _acc.PROTECTED: "protected",
+    _acc.PRIVATE:   "private",
+}
+
+
+def access_of(cursor: clang.cindex.Cursor) -> str:
+    """Return 'public'/'protected'/'private', or '' for non-member declarations."""
+    return _ACCESS_NAMES.get(cursor.access_specifier, "")
+
 
 FUNCTION_KINDS = {
     _ck.FUNCTION_DECL,
@@ -208,11 +221,11 @@ def _insert_header_methods(
         conn.execute(
             """INSERT INTO functions
                (qualified_name, display_name, file_id, line_start, line_end,
-                kind, is_definition, source_code, comment)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                kind, is_definition, source_code, comment, access)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (qname, _method_signature(child), file_id,
              ext.start.line, ext.end.line,
-             child.kind.name, is_def, code, comment),
+             child.kind.name, is_def, code, comment, access_of(child)),
         )
 
 
@@ -233,7 +246,8 @@ def type_summary(cursor: clang.cindex.Cursor) -> str:
         return f"typedef {underlying} {cursor.spelling};"
 
     # CLASS_DECL, STRUCT_DECL, CLASS_TEMPLATE, partial specialisation
-    keyword = "struct" if cursor.kind == _ck.STRUCT_DECL else "class"
+    is_struct = cursor.kind == _ck.STRUCT_DECL
+    keyword   = "struct" if is_struct else "class"
     bases = [
         c.spelling for c in cursor.get_children()
         if c.kind == _ck.CXX_BASE_SPECIFIER
@@ -243,12 +257,22 @@ def type_summary(cursor: clang.cindex.Cursor) -> str:
         header += " : " + ", ".join(bases)
 
     lines = [header + " {"]
+    # Default access: public for struct, private for class/class template.
+    current_access: str = "public" if is_struct else "private"
+    member_kinds = {
+        _ck.FIELD_DECL, _ck.CXX_METHOD, _ck.CONSTRUCTOR, _ck.DESTRUCTOR,
+        _ck.FUNCTION_TEMPLATE,
+    }
     for child in cursor.get_children():
+        if child.kind not in member_kinds:
+            continue
+        acc = access_of(child) or current_access
+        if acc != current_access:
+            lines.append(f"{acc}:")
+            current_access = acc
         if child.kind == _ck.FIELD_DECL:
             lines.append(f"  {child.type.spelling} {child.spelling};")
-        elif child.kind in (
-            _ck.CXX_METHOD, _ck.CONSTRUCTOR, _ck.DESTRUCTOR, _ck.FUNCTION_TEMPLATE
-        ):
+        else:
             lines.append(f"  {_method_signature(child)};")
     lines.append("};")
     return "\n".join(lines)
@@ -291,7 +315,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             kind           TEXT,
             is_definition  INTEGER,
             source_code    TEXT,
-            comment        TEXT
+            comment        TEXT,
+            access         TEXT
         );
 
         CREATE TABLE IF NOT EXISTS types (
@@ -413,11 +438,11 @@ def process_file(
                 cur = conn.execute(
                     """INSERT INTO functions
                        (qualified_name, display_name, file_id, line_start, line_end,
-                        kind, is_definition, source_code, comment)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        kind, is_definition, source_code, comment, access)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (qname, _method_signature(cursor), hdr_id,
                      ext.start.line, ext.end.line,
-                     cursor.kind.name, int(is_def), code, comment),
+                     cursor.kind.name, int(is_def), code, comment, access_of(cursor)),
                 )
                 func_id = cur.lastrowid
                 n_funcs += 1

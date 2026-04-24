@@ -20,26 +20,45 @@ from ..db import (
 )
 
 
-def caller_class_fields(conn: sqlite3.Connection, caller_qname: str) -> str | None:
-    """Return a terse field listing for the class that contains caller_qname.
+_ACCESS_LABELS = ("public:", "protected:", "private:")
 
-    Only field declarations are included (no methods, no structural lines) so
-    the agent can resolve unknown variables like `geom` or `molecules[imol]`
-    without being swamped by the full class definition.
-    Returns None if the caller has no containing class or the class has no fields.
+
+def caller_class_fields(conn: sqlite3.Connection, caller_qname: str) -> str | None:
+    """Return a terse listing of PUBLIC field declarations for the class that
+    contains caller_qname.
+
+    Non-public fields are suppressed: oracle.cc is external code and cannot
+    reach private/protected members. Methods and structural lines are
+    filtered out — only fields survive. Returns None if there are no usable
+    public fields.
     """
     cls = get_containing_class(conn, caller_qname)
     if not cls or not cls["summary"]:
         return None
-    fields = [
-        line for line in cls["summary"].splitlines()
-        if line.strip()
-        and "(" not in line
-        and not line.strip().startswith(("class ", "struct ", "};"))
-    ]
+
+    current_access = "public"  # assume public until we see an access label
+    # For a `class`, the true default is private — but we don't know whether
+    # this summary is a class or a struct here. The access labels emitted by
+    # extract_graph.py's type_summary make the first section unambiguous.
+    fields: list[str] = []
+    for line in cls["summary"].splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped in _ACCESS_LABELS:
+            current_access = stripped[:-1]
+            continue
+        if stripped.startswith(("class ", "struct ", "};")):
+            continue
+        if "(" in stripped:
+            continue  # method signature, not a field
+        if current_access != "public":
+            continue
+        fields.append(line)
+
     if not fields:
         return None
-    return f"// Fields of {cls['qualified_name']}:\n" + "\n".join(fields)
+    return f"// Public fields of {cls['qualified_name']}:\n" + "\n".join(fields)
 
 # mmdb::Manager key methods are inherited from mmdb::Root / mmdb::CoorMngrRoot
 # and don't appear on Manager directly, so we use a hardcoded setup pattern.
@@ -108,6 +127,16 @@ Requirements:
        INPUT  <name>: <value>
        OUTPUT <name>: <value>
 
+ACCESS RULES (oracle.cc is EXTERNAL client code — not a member of any class):
+  * You may only call PUBLIC methods and read PUBLIC fields.
+  * Members under `private:` or `protected:` are hidden from the context below,
+    or marked "non-public members hidden". Do not invent accesses to them.
+  * EXAMPLE CALLERS marked "[in-class caller]" are member functions of the
+    same class, so they legitimately touch private state. Do NOT copy that
+    private access pattern into oracle.cc — use the public API instead
+    (look for a public getter/setter/accessor, or construct the object
+    through a public factory that initialises the state for you).
+
 Use the EXAMPLE CALLERS to understand how the function is typically invoked and
 what objects are needed. Only use types and methods shown in the context below.\
 """
@@ -152,6 +181,10 @@ def _render_type(
 
     compact=True (oracle mode): omit all fields; show only constructors and
     called methods so the prompt stays focused on what the oracle needs to call.
+
+    Members inside `private:` / `protected:` sections are suppressed — oracle.cc
+    is external code and cannot call them. The access labels themselves are
+    preserved so the agent sees where the cut-off is.
     """
     method_rows = get_type_methods(conn, type_qname)
     comment_map = {r["display_name"]: r["comment"] or "" for r in method_rows}
@@ -159,10 +192,19 @@ def _render_type(
 
     out_lines: list[str] = []
     elided = 0
+    current_access = "public"  # safest default; will be corrected by labels
+    hidden_nonpublic = 0
 
     for line in summary.splitlines():
         stripped      = line.strip()
         candidate     = stripped.rstrip(";")
+
+        # Access-specifier line → always emit, update state.
+        if stripped in _ACCESS_LABELS:
+            current_access = stripped[:-1]
+            out_lines.append(line)
+            continue
+
         # Detect method lines by signature syntax (parentheses) rather than
         # comment_map membership — methods not yet in the functions table would
         # otherwise be misidentified as fields and dropped in compact mode.
@@ -170,6 +212,11 @@ def _render_type(
         is_structural = not stripped or stripped.startswith(("class ", "struct ", "};"))
         bare_name     = candidate.split("(")[0].strip()
         is_ctor       = bare_name == class_short
+
+        # Suppress anything non-public — oracle.cc can't reach it.
+        if current_access != "public" and not is_structural:
+            hidden_nonpublic += 1
+            continue
 
         if compact and not is_method and not is_structural:
             continue  # drop field lines
@@ -186,8 +233,11 @@ def _render_type(
         else:
             out_lines.append(line)
 
-    if elided and out_lines and out_lines[-1].strip() == "};":
-        out_lines.insert(-1, f"  // ... ({elided} more methods)")
+    if out_lines and out_lines[-1].strip() == "};":
+        if elided:
+            out_lines.insert(-1, f"  // ... ({elided} more public methods)")
+        if hidden_nonpublic:
+            out_lines.insert(-1, f"  // ... ({hidden_nonpublic} non-public members hidden — oracle cannot access)")
 
     return "\n".join(out_lines)
 
