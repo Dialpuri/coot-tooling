@@ -29,6 +29,7 @@ from pathlib import Path
 from .db import connect, get_class_functions
 from .oracle.generate import DEFAULT_MODEL, OUT_ROOT, generate_one, sanitize_name
 from .test.generate import generate_test
+from .gemmi.generate import generate_gemmi
 
 
 # ── result tracking ───────────────────────────────────────────────────────────
@@ -39,6 +40,7 @@ class Result:
         self.skipped    = False
         self.oracle_ok: bool | None = None
         self.test_ok:   bool | None = None
+        self.gemmi_ok:  bool | None = None
         self.error:     str  | None = None
 
     @property
@@ -55,6 +57,7 @@ def _process(
     verbose: bool,
     skip_oracle: bool,
     skip_existing: bool,
+    with_gemmi: bool = False,
 ) -> Result:
     r = Result(qname)
     out_dir = OUT_ROOT / sanitize_name(qname)
@@ -93,6 +96,16 @@ def _process(
     except Exception as e:
         r.test_ok = False
         r.error = f"test generation failed: {e}"
+        return r
+
+    # ── gemmi port phase (optional) ───────────────────────────────────────────
+    if with_gemmi:
+        try:
+            generate_gemmi(out_dir, qname, model=model, verbose=verbose)
+            r.gemmi_ok = True
+        except Exception as e:
+            r.gemmi_ok = False
+            r.error = f"gemmi port failed: {e}"
 
     return r
 
@@ -103,7 +116,9 @@ def _print_summary(results: list[Result]) -> None:
     sym = {True: "✓", False: "✗", None: " "}
     skip_sym = "–"
 
-    header = f"{'method':<50}  oracle  test"
+    has_gemmi = any(r.gemmi_ok is not None for r in results)
+    header = (f"{'method':<50}  oracle  test"
+              + ("  gemmi" if has_gemmi else ""))
     print("\n" + header)
     print("-" * len(header))
 
@@ -115,11 +130,14 @@ def _print_summary(results: list[Result]) -> None:
             continue
 
         row = f"{r.short:<50}  {sym[r.oracle_ok]}       {sym[r.test_ok]}"
+        if has_gemmi:
+            row += f"      {sym[r.gemmi_ok]}"
         if r.error:
             row += f"  ← {r.error.splitlines()[0]}"
         print(row)
 
-        if r.oracle_ok and r.test_ok:
+        stage_ok = r.oracle_ok and r.test_ok and (r.gemmi_ok is not False)
+        if stage_ok:
             ok += 1
         else:
             fail += 1
@@ -143,6 +161,8 @@ def main() -> None:
     parser.add_argument("--verbose",       action="store_true", help="Print thinking and tool calls to console")
     parser.add_argument("--skip-oracle",   action="store_true", help="Skip oracle generation if oracle.cc already exists; go straight to test generation")
     parser.add_argument("--skip-existing", action="store_true", help="Skip methods that already have oracle.cc")
+    parser.add_argument("--with-gemmi",    action="store_true",
+                        help="After test succeeds, also run the combined gemmi port + test stage")
     parser.add_argument("--workers",       type=int, default=1, metavar="N",
                         help="Parallel workers (default 1)")
     parser.add_argument("--list",          action="store_true", help="List matching methods and exit")
@@ -177,7 +197,8 @@ def main() -> None:
         for i, qname in enumerate(qnames, 1):
             print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]} ...", end=" ", flush=True)
             r = _process(qname, args.model, args.agent, args.verbose,
-                         args.skip_oracle, args.skip_existing)
+                         args.skip_oracle, args.skip_existing,
+                         with_gemmi=args.with_gemmi)
             results.append(r)
             if r.skipped:
                 print("skipped")
@@ -190,7 +211,8 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             for qname in qnames:
                 f = pool.submit(_process, qname, args.model, args.agent,
-                                args.verbose, args.skip_oracle, args.skip_existing)
+                                args.verbose, args.skip_oracle, args.skip_existing,
+                                args.with_gemmi)
                 futures[f] = qname
             for f in as_completed(futures):
                 r = f.result()

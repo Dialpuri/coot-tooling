@@ -1,0 +1,367 @@
+"""Combined agentic port: function.hh (+ optional function.cc) + test.cc in one session.
+
+The original MMDB function source and its MMDB-based test are both supplied.
+The agent produces a gemmi equivalent of the function AND a gemmi version of
+the test that exercises it — compiled and linked as a single unit so
+signatures agree by construction.
+
+Frozen: every EXPECT_* / ASSERT_* line from the original test.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import textwrap
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from ..oracle.agent import (
+    OLLAMA_CHAT_URL, TOOLS, _dispatch,
+    _EXTENSION_TURNS, _MAX_EXTENSIONS, _EXTENSION_PROMPT,
+)
+from .compile import MAX_COMPILE_ATTEMPTS, compile_gemmi, run_gemmi_test_binary
+
+GEMMI_SYSTEM_PROMPT = """\
+You are porting ONE C++ function from the MMDB API to the gemmi API AND
+translating its Google Test, in the same session.
+
+Produce three artifacts:
+  A. function.hh — header with declaration and #include <gemmi/...> deps.
+     Use `#pragma once`. If the body is short, put it here as `inline`.
+  B. function.cc — OPTIONAL. Only emit if the body is long or uses
+     translation-unit-private helpers. Otherwise omit it entirely.
+  C. test.cc — the gemmi-translated Google Test, #include "function.hh".
+
+Rules:
+1. FREEZE every EXPECT_* / ASSERT_* line from the original test. Expected
+   values are the correctness oracle. Do not edit numbers or comparisons.
+2. Translate only setup (PDB loading, iteration, types) and the call site.
+3. Port the function semantics 1:1 — same output for the same input.
+4. The function signature must match what test.cc calls. Design them together.
+5. Use find_symbol / get_type / grep_codebase to verify every gemmi name
+   before using it. Do not invent APIs.
+6. Link target: test.cc (+ function.cc if present) against -lgemmi_cpp and
+   -lgtest. No MMDB, no clipper, no coot libraries.
+7. Call compile_gemmi with your drafts. Fix errors until it builds. Then
+   call run_gemmi_test to confirm assertions pass. Max 4 compile attempts.
+
+Final output format (ONE response, THREE fenced blocks in this exact order):
+
+```cpp:function.hh
+... header contents ...
+```
+
+```cpp:function.cc
+... only if needed; otherwise omit this block entirely ...
+```
+
+```cpp:test.cc
+... test contents ...
+```
+
+If you omit function.cc, just skip the middle block.\
+"""
+
+_COMPILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "compile_gemmi",
+        "description": (
+            "Write the supplied sources to disk (function.hh, test.cc, and "
+            "optionally function.cc) and compile them as one unit linked "
+            f"against -lgemmi_cpp and -lgtest. Max {MAX_COMPILE_ATTEMPTS} attempts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "function_hh": {"type": "string",
+                                "description": "Contents of function.hh"},
+                "test_cc":     {"type": "string",
+                                "description": "Contents of test.cc"},
+                "function_cc": {"type": "string",
+                                "description": "Optional contents of function.cc "
+                                               "(omit for header-only)"},
+            },
+            "required": ["function_hh", "test_cc"],
+        },
+    },
+}
+
+_RUN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_gemmi_test",
+        "description": "Run the last compiled test binary and return GoogleTest output.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+_GET_ERRORS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_compile_errors",
+        "description": "Return the full last compile log without truncation.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+GEMMI_TOOLS = TOOLS + [_COMPILE_TOOL, _RUN_TOOL, _GET_ERRORS_TOOL]
+
+
+def _make_tool_handlers(gemmi_subdir: Path) -> tuple[callable, callable, callable]:
+    attempts       = [0]
+    last_binary    = [None]
+    last_error_log = [None]
+
+    def compile_handler(function_hh: str, test_cc: str,
+                        function_cc: str | None = None) -> str:
+        if attempts[0] >= MAX_COMPILE_ATTEMPTS:
+            return (f"Compile limit reached ({MAX_COMPILE_ATTEMPTS}). "
+                    "Output your best drafts as the final fenced blocks.")
+        attempts[0] += 1
+        gemmi_subdir.mkdir(exist_ok=True)
+
+        hh_path   = gemmi_subdir / "function.hh"
+        test_path = gemmi_subdir / "test.cc"
+        cc_path   = gemmi_subdir / "function.cc"
+        hh_path.write_text(function_hh)
+        test_path.write_text(test_cc)
+        if function_cc:
+            cc_path.write_text(function_cc)
+            fn_cc_arg = cc_path
+        else:
+            if cc_path.exists():
+                cc_path.unlink()
+            fn_cc_arg = None
+
+        test_bin = gemmi_subdir / "test_check"
+        success, output = compile_gemmi(test_path, test_bin, fn_cc_arg)
+
+        error_log = gemmi_subdir / "compile_error.log"
+        error_log.write_text(output)
+        lines = output.splitlines()
+        if len(lines) > 120:
+            output = ("\n".join(lines[:120])
+                      + f"\n... ({len(lines) - 120} more — use get_compile_errors)")
+        if success:
+            last_binary[0] = test_bin
+            return f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS})."
+        last_binary[0] = None
+        last_error_log[0] = error_log
+        return f"Compilation FAILED (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}):\n{output}"
+
+    def run_handler() -> str:
+        if last_binary[0] is None:
+            return "No compiled binary — call compile_gemmi first."
+        success, output = run_gemmi_test_binary(last_binary[0])
+        lines = output.splitlines()
+        if len(lines) > 100:
+            output = "\n".join(lines[:100]) + f"\n... ({len(lines) - 100} more lines)"
+        status = "All tests PASSED." if success else "Some tests FAILED."
+        return f"{status}\n{output}"
+
+    def get_errors_handler() -> str:
+        if last_error_log[0] is None or not last_error_log[0].exists():
+            return "No compile error log available."
+        return last_error_log[0].read_text()
+
+    return compile_handler, run_handler, get_errors_handler
+
+
+def _chat(messages: list[dict], model: str, tools: list[dict]) -> dict:
+    payload = json.dumps({"model": model, "messages": messages,
+                          "tools": tools, "stream": False, "think": True}).encode()
+    req = urllib.request.Request(OLLAMA_CHAT_URL, data=payload,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        return json.loads(resp.read())
+
+
+_BLOCK_RE = re.compile(
+    r"```(?:cpp|c\+\+)?(?::([^\n]+))?\n(.*?)```",
+    re.DOTALL,
+)
+
+
+def _extract_blocks(content: str) -> dict[str, str]:
+    """Pull named fenced blocks out of the assistant's final message.
+
+    Accepts labelled fences like ```cpp:function.hh or falls back to ordering
+    (hh, cc, test) if labels are missing.
+    """
+    found: dict[str, str] = {}
+    unlabelled: list[str] = []
+    for label, body in _BLOCK_RE.findall(content):
+        body = body.strip()
+        label = (label or "").strip().lower()
+        if "function.hh" in label or label.endswith(".hh"):
+            found["function.hh"] = body
+        elif "function.cc" in label or label.endswith("function.cc"):
+            found["function.cc"] = body
+        elif "test.cc" in label or label.endswith("test.cc"):
+            found["test.cc"] = body
+        else:
+            unlabelled.append(body)
+    if unlabelled:
+        keys = ["function.hh", "function.cc", "test.cc"]
+        for key in keys:
+            if key not in found and unlabelled:
+                found[key] = unlabelled.pop(0)
+    return found
+
+
+def generate_gemmi_port_with_agent(
+    conn: sqlite3.Connection,
+    original_function_src: str,
+    function_qname: str,
+    original_test_cc: str,
+    gemmi_subdir: Path,
+    model: str,
+    verbose: bool = False,
+) -> tuple[dict[str, str] | None, str]:
+    """Return ({file_name: contents, ...}, trace_text) or (None, trace) on failure."""
+    compile_handler, run_handler, get_errors_handler = _make_tool_handlers(gemmi_subdir)
+
+    def dispatch(name: str, args: dict) -> str:
+        if name == "compile_gemmi":
+            return compile_handler(
+                args.get("function_hh", ""),
+                args.get("test_cc", ""),
+                args.get("function_cc") or None,
+            )
+        if name == "run_gemmi_test":
+            return run_handler()
+        if name == "get_compile_errors":
+            return get_errors_handler()
+        return _dispatch(conn, name, args)
+
+    user_content = (
+        f"Port `{function_qname}` to gemmi AND translate its MMDB test in one "
+        "pass.\n\n"
+        f"Original MMDB function:\n```cpp\n{original_function_src}\n```\n\n"
+        f"Original MMDB test (FREEZE every EXPECT_*):\n"
+        f"```cpp\n{original_test_cc}\n```\n\n"
+        "Design the gemmi function signature and the test's call site "
+        "together. Use the tools to resolve gemmi types. Compile and run "
+        "before finalising."
+    )
+
+    messages: list[dict] = [
+        {"role": "system", "content": GEMMI_SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
+    ]
+    trace_lines: list[str] = [
+        "=== GEMMI COMBINED AGENT TRACE ===\n",
+        f"[user]\n{textwrap.indent(user_content, '  ')}\n",
+    ]
+
+    final_blocks: dict[str, str] | None = None
+    last_draft: list[dict[str, str] | None] = [None]
+    call_counts: dict[str, int] = {}
+    REPEAT_LIMIT = 3
+
+    def _save_draft_from_compile(args: dict) -> None:
+        hh = args.get("function_hh") or ""
+        tc = args.get("test_cc") or ""
+        if len(hh) > 50 and len(tc) > 100 and "#include" in tc:
+            last_draft[0] = {
+                "function.hh": hh,
+                "test.cc": tc,
+                **({"function.cc": args["function_cc"]}
+                   if args.get("function_cc") else {}),
+            }
+
+    def _run_tool_calls(tool_calls: list[dict]) -> list[dict]:
+        results: list[dict] = []
+        for call in tool_calls:
+            fn_info = call.get("function", {})
+            name    = fn_info.get("name", "")
+            args    = fn_info.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if name == "compile_gemmi":
+                _save_draft_from_compile(args)
+            hash_args = {k: v for k, v in args.items()
+                         if k not in ("function_hh", "function_cc", "test_cc")}
+            key = f"{name}:{json.dumps(hash_args, sort_keys=True)}"
+            call_counts[key] = call_counts.get(key, 0) + 1
+            if call_counts[key] > REPEAT_LIMIT and name not in ("compile_gemmi", "run_gemmi_test"):
+                nudge = (
+                    f"You have called {name} with these arguments {call_counts[key]} times. "
+                    "Stop repeating — proceed to compile_gemmi with your best drafts."
+                )
+                trace_lines.append(f"  → {name}(repeated — nudged)")
+                results.append({"role": "tool", "content": nudge})
+                continue
+            if verbose:
+                display = ({"function_hh": "...", "test_cc": "...",
+                            "function_cc": "..." if args.get("function_cc") else None}
+                           if name == "compile_gemmi" else args)
+                print(f"  tool: {name}({display})")
+            result_text = dispatch(name, args)
+            result_lines = result_text.splitlines()
+            if len(result_lines) > 150:
+                result_text = ("\n".join(result_lines[:150])
+                               + f"\n... ({len(result_lines) - 150} more lines)")
+            trace_lines.append(
+                f"  → {name}({json.dumps(args) if name != 'compile_gemmi' else '{...}'})"
+            )
+            trace_lines.append(textwrap.indent(result_text, "      ") + "\n")
+            results.append({"role": "tool", "content": result_text})
+        return results
+
+    def _is_usable(blocks: dict[str, str] | None) -> bool:
+        if not blocks:
+            return False
+        return ("function.hh" in blocks and "test.cc" in blocks
+                and "#include" in blocks["test.cc"])
+
+    for turn in range(25):
+        data = _chat(messages, model, GEMMI_TOOLS)
+        msg  = data.get("message", {})
+        tool_calls        = msg.get("tool_calls") or []
+        thinking          = msg.get("thinking",  "") or ""
+        assistant_content = msg.get("content",   "") or ""
+        messages.append({"role": "assistant", "content": assistant_content,
+                         "tool_calls": tool_calls})
+        if thinking:
+            trace_lines.append(f"[thinking — turn {turn + 1}]\n{textwrap.indent(thinking, '  ')}\n")
+        if not tool_calls:
+            trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")
+            final_blocks = _extract_blocks(assistant_content) or None
+            break
+        trace_lines.append(f"[assistant — turn {turn + 1}, {len(tool_calls)} tool call(s)]")
+        messages.extend(_run_tool_calls(tool_calls))
+    else:
+        trace_lines.append("[agent] Turn limit reached.\n")
+
+    if not _is_usable(final_blocks) and _is_usable(last_draft[0]):
+        trace_lines.append("[agent] Falling back to last compile_gemmi draft.\n")
+        final_blocks = last_draft[0]
+    elif not _is_usable(final_blocks):
+        trace_lines.append("[agent] No usable output — issuing rescue prompt.\n")
+        messages.append({"role": "user", "content": (
+            "STOP. Do not call any tools. Output your best attempt NOW as "
+            "three fenced blocks labelled ```cpp:function.hh, optionally "
+            "```cpp:function.cc, and ```cpp:test.cc."
+        )})
+        try:
+            data = _chat(messages, model, tools=[])
+            assistant_content = (data.get("message") or {}).get("content") or ""
+            trace_lines.append(f"[assistant — rescue]\n{textwrap.indent(assistant_content, '  ')}\n")
+            rescued = _extract_blocks(assistant_content)
+            if _is_usable(rescued):
+                final_blocks = rescued
+            elif _is_usable(last_draft[0]):
+                final_blocks = last_draft[0]
+        except (urllib.error.URLError, json.JSONDecodeError) as e:
+            trace_lines.append(f"[agent] Rescue call failed: {e}\n")
+            if _is_usable(last_draft[0]):
+                final_blocks = last_draft[0]
+
+    return final_blocks, "\n".join(trace_lines)
