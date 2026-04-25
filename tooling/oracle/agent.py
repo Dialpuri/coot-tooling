@@ -35,6 +35,41 @@ from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNI
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 
+# Ollama runtime options. These override the model's Modelfile defaults for
+# this request only. The defaults below assume a long-running tool-calling
+# loop where 12+ turns of accumulated tool output are routine; the stock
+# 4096-token context silently rolls system + early user messages off the
+# front, which causes the model to "forget" its output-format rules and
+# ramble in plain prose. Override per environment via env vars if needed.
+OLLAMA_OPTIONS = {
+    "num_ctx":        int(os.environ.get("CT_OLLAMA_NUM_CTX",     32768)),
+    "num_predict":    int(os.environ.get("CT_OLLAMA_NUM_PREDICT", -1)),
+    "temperature":    float(os.environ.get("CT_OLLAMA_TEMP",      0.2)),
+    # top_p / top_k tighten the sampling distribution above and beyond
+    # temperature. 0.9 / 20 is a stricter pair than ollama's defaults
+    # (0.9 / 40), keeping the model on-track for structured code output.
+    "top_p":          float(os.environ.get("CT_OLLAMA_TOP_P",     0.9)),
+    "top_k":          int(os.environ.get("CT_OLLAMA_TOP_K",       20)),
+    # repeat_penalty=1.0 disables ollama's default 1.1 — that default
+    # silently corrupts code where legitimate repetition is structural
+    # (parallel EXPECT_EQ lines, identical #include blocks, twin loops).
+    "repeat_penalty": float(os.environ.get("CT_OLLAMA_REPEAT_PENALTY", 1.0)),
+}
+
+# Periodic format-reminder cadence. Transformer attention skews toward the
+# start and end of the context with a measurable dip in the middle ("lost in
+# the middle"); after several tool-call turns the original system prompt is
+# buried where the model attends to it less. Re-injecting a short reminder
+# every N turns puts the format spec back near the end of the context where
+# attention is strongest. Set to 0 to disable.
+NUDGE_EVERY_N_TURNS = int(os.environ.get("CT_AGENT_NUDGE_EVERY", 5))
+
+# Hard "stop researching, start compiling" nudge. If this many turns elapse
+# without a single attempt at the compile tool, fire a one-shot warning that
+# names the tool explicitly. Targets the failure mode where the model
+# spends 12+ turns analysing instead of testing a draft. Set to 0 to disable.
+NO_COMPILE_AFTER = int(os.environ.get("CT_AGENT_NO_COMPILE_AFTER", 6))
+
 NOTES_DIR     = Path(__file__).parent / "notes"
 ANSWER_MARKER = "## Answer"
 TEST_DATA_DIR = Path(__file__).parent.parent.parent / "test-data"
@@ -77,6 +112,22 @@ _EXTENSION_PROMPT = (
     "If you still need to compile, run, or fix errors, respond with tool calls "
     "and you will receive {n} more turns. "
     "If you are done, output the final program in a ```cpp block now."
+)
+
+# Format-reminder nudges (injected every NUDGE_EVERY_N_TURNS turns). Kept
+# short — they're appended several times during a long run.
+_ORACLE_NUDGE = (
+    "Reminder: when you stop calling tools, your final reply must be a "
+    "single ```cpp fenced block containing the complete oracle.cc. "
+    "If you have a working draft, call compile_oracle now to validate it."
+)
+
+_ORACLE_NO_COMPILE_NUDGE = (
+    "WARNING: you have not attempted compile_oracle yet. "
+    "Stop researching and DRAFT your best oracle.cc now, then call "
+    "compile_oracle. The compiler's error messages are far more useful "
+    "than further speculation. Failures are expected — you have multiple "
+    "retries to fix them. Action over analysis."
 )
 
 # ── tool schema ───────────────────────────────────────────────────────────────
@@ -381,6 +432,40 @@ _RUN_ORACLE_TOOL = {
 ORACLE_TOOLS = TOOLS + [_COMPILE_ORACLE_TOOL, _RUN_ORACLE_TOOL]
 
 
+class _TraceWriter:
+    """Buffered trace that also streams to disk on each append.
+
+    Drop-in for the previous `list[str]` pattern: only `append`/`extend` and
+    `text()` are needed. The on-disk file is line-buffered and flushed after
+    every write so `tail -f` shows progress live during a run.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._lines: list[str] = []
+        self._fp = None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._fp = path.open("w", buffering=1)
+
+    def append(self, line: str) -> None:
+        self._lines.append(line)
+        if self._fp is not None:
+            self._fp.write(line + "\n")
+            self._fp.flush()
+
+    def extend(self, lines) -> None:
+        for line in lines:
+            self.append(line)
+
+    def text(self) -> str:
+        return "\n".join(self._lines)
+
+    def close(self) -> None:
+        if self._fp is not None:
+            self._fp.close()
+            self._fp = None
+
+
 # ── tool implementations ──────────────────────────────────────────────────────
 
 def _tool_read_file(path: str, offset: int = 0, limit: int = 300) -> str:
@@ -524,6 +609,47 @@ def _unanswered_notes() -> list[Path]:
 
 _INCLUDE_RE = re.compile(r'#include\s+([<"])([^">]+)[">]')
 
+# C++ and C standard-library headers come from the compiler's built-in
+# include path, not from ALLOWED_READ_ROOTS. Without this allowlist the
+# resolver flags them as MISSING — and worse, can produce dangerous
+# "WRONG PATH" suggestions when rglob picks up an unrelated project file
+# that shares the name (e.g. `<string>` matched against
+# numpy/f2py/tests/src/string). The list covers C++17/20 + C-compatibility
+# headers + POSIX system headers commonly used in this codebase.
+_STDLIB_HEADERS: frozenset[str] = frozenset({
+    # C++ containers / utilities
+    "algorithm", "any", "array", "atomic", "barrier", "bit", "bitset",
+    "charconv", "chrono", "compare", "complex", "concepts",
+    "condition_variable", "coroutine", "deque", "exception", "execution",
+    "expected", "filesystem", "format", "forward_list", "fstream",
+    "functional", "future", "generator", "initializer_list", "iomanip",
+    "ios", "iosfwd", "iostream", "istream", "iterator", "latch", "limits",
+    "list", "locale", "map", "memory", "memory_resource", "mutex", "new",
+    "numbers", "numeric", "optional", "ostream", "print", "queue", "random",
+    "ranges", "ratio", "regex", "scoped_allocator", "semaphore", "set",
+    "shared_mutex", "source_location", "span", "sstream", "stack",
+    "stacktrace", "stdexcept", "stop_token", "streambuf", "string",
+    "string_view", "syncstream", "system_error", "thread", "tuple",
+    "type_traits", "typeindex", "typeinfo", "unordered_map", "unordered_set",
+    "utility", "valarray", "variant", "vector", "version",
+    # C-compatibility (cXXX)
+    "cassert", "cctype", "cerrno", "cfenv", "cfloat", "cinttypes",
+    "climits", "clocale", "cmath", "csetjmp", "csignal", "cstdarg",
+    "cstdbool", "cstddef", "cstdint", "cstdio", "cstdlib", "cstring",
+    "ctime", "cuchar", "cwchar", "cwctype",
+    # C standard library (legacy .h)
+    "assert.h", "complex.h", "ctype.h", "errno.h", "fenv.h", "float.h",
+    "inttypes.h", "iso646.h", "limits.h", "locale.h", "math.h", "setjmp.h",
+    "signal.h", "stdalign.h", "stdarg.h", "stdatomic.h", "stdbool.h",
+    "stddef.h", "stdint.h", "stdio.h", "stdlib.h", "stdnoreturn.h",
+    "string.h", "tgmath.h", "threads.h", "time.h", "uchar.h", "wchar.h",
+    "wctype.h",
+    # POSIX / system headers commonly needed
+    "dirent.h", "fcntl.h", "getopt.h", "libgen.h", "pthread.h", "regex.h",
+    "sched.h", "semaphore.h", "strings.h", "syslog.h", "termios.h",
+    "unistd.h", "utime.h",
+})
+
 
 def _fmt_include(path: str, delim: str) -> str:
     return f'#include "{path}"' if delim == '"' else f'#include <{path}>'
@@ -539,6 +665,14 @@ def _tool_resolve_includes(code: str) -> str:
     for delim, inc in includes:
         shown = _fmt_include(inc, delim)
 
+        # Short-circuit C++/C/POSIX standard-library headers. They live in
+        # the compiler's built-in include path, not ALLOWED_READ_ROOTS, so
+        # without this check they spuriously fail. A bracket form with no
+        # path separator and a name in the stdlib allowlist is always OK.
+        if delim == "<" and "/" not in inc and inc in _STDLIB_HEADERS:
+            lines.append(f'OK  {shown}  (C/C++ standard library)')
+            continue
+
         # Try resolving from each allowed root directly.
         found_at: list[str] = []
         for root in ALLOWED_READ_ROOTS:
@@ -551,10 +685,19 @@ def _tool_resolve_includes(code: str) -> str:
             continue
 
         # Not found at the given path — search by filename across the tree.
+        # Skip common junk dirs that produce dangerous false positives —
+        # e.g. rglob("string") would otherwise match
+        # ".venv/lib/python3.13/site-packages/numpy/f2py/tests/src/string"
+        # and the model would obediently change its #include to that path,
+        # breaking the build.
+        _SKIP_DIR_PARTS = {".venv", ".git", "node_modules", "__pycache__",
+                           "build", "_build", "dist", ".tox", ".cache"}
         filename = Path(inc).name
         matches: list[Path] = []
         for root in ALLOWED_READ_ROOTS:
-            matches.extend(Path(root).rglob(filename))
+            for candidate in Path(root).rglob(filename):
+                if not _SKIP_DIR_PARTS.intersection(candidate.parts):
+                    matches.append(candidate)
         matches = sorted(set(matches))[:5]
 
         if not matches:
@@ -946,6 +1089,7 @@ def _chat(messages: list[dict], model: str, tools: list[dict]) -> dict:
         "tools":    tools,
         "stream":   False,
         "think":    True,
+        "options":  OLLAMA_OPTIONS,
     }).encode()
     req = urllib.request.Request(
         OLLAMA_CHAT_URL,
@@ -1049,10 +1193,11 @@ def generate_with_agent(
             f"=== USER ===\n{user_content}\n"
         )
 
-    trace_lines: list[str] = [
-        f"=== AGENT TRACE: {function_qname} ===\n",
-        f"[user]\n{textwrap.indent(user_content, '  ')}\n",
-    ]
+    trace_lines = _TraceWriter(
+        (oracle_out / "agent_trace.txt") if oracle_out is not None else None
+    )
+    trace_lines.append(f"=== AGENT TRACE: {function_qname} ===\n")
+    trace_lines.append(f"[user]\n{textwrap.indent(user_content, '  ')}\n")
 
     compile_handler, run_handler = (
         _make_oracle_tool_handlers(oracle_out) if oracle_out else (None, None)
@@ -1071,7 +1216,12 @@ def generate_with_agent(
     oracle_code: str | None = None
     last_draft: list[str | None] = [None]    # any cpp draft we've ever seen (fallback)
     call_counts: dict[str, int] = {}         # repeat-call detection
+    tool_cache: dict[str, str] = {}          # memoize read-only lookups within a session
     REPEAT_LIMIT = 3
+    no_compile_warned = [False]              # one-shot guard for the no-compile nudge
+    # Tools whose output may differ across calls or which have side effects —
+    # never serve from cache.
+    NO_CACHE = {"compile_oracle", "run_oracle", "leave_note"}
 
     def _save_draft(code: str) -> None:
         if code and len(code) > 100 and "#include" in code:
@@ -1099,6 +1249,20 @@ def generate_with_agent(
             key = f"{name}:{json.dumps(hash_args, sort_keys=True)}"
             call_counts[key] = call_counts.get(key, 0) + 1
 
+            # Memoize read-only lookups: identical (tool, args) returns the
+            # prior result with a "(cached)" header so the agent recognises
+            # it has already seen this. Saves dispatch cost AND, more
+            # importantly, signals "stop asking the same thing".
+            if name not in NO_CACHE and key in tool_cache:
+                cached = tool_cache[key]
+                note = (
+                    "(cached — you already called this with the same arguments. "
+                    "Use the answer below; do not re-query.)\n"
+                )
+                trace_lines.append(f"  → [cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
+                results.append({"role": "tool", "content": note + cached})
+                continue
+
             if call_counts[key] > REPEAT_LIMIT and name not in ("compile_oracle", "run_oracle"):
                 nudge = (
                     f"You have already called {name} with these arguments "
@@ -1118,6 +1282,8 @@ def generate_with_agent(
                 result = "\n".join(result_lines[:150]) + f"\n... ({len(result_lines) - 150} more lines)"
             trace_lines.append(f"  → {name}({json.dumps(args)})")
             trace_lines.append(textwrap.indent(result, "      ") + "\n")
+            if name not in NO_CACHE:
+                tool_cache[key] = result
             results.append({"role": "tool", "content": result})
         return results
 
@@ -1148,6 +1314,20 @@ def generate_with_agent(
 
         trace_lines.append(f"[assistant — turn {turn + 1}, {len(tool_calls)} tool call(s)]")
         messages.extend(_run_tool_calls(tool_calls))
+
+        # One-shot "you haven't compiled anything" warning. Fires when the
+        # threshold is reached without a single compile_oracle attempt — the
+        # model is researching instead of testing.
+        if (NO_COMPILE_AFTER and not no_compile_warned[0]
+                and (turn + 1) >= NO_COMPILE_AFTER
+                and not any(k.startswith("compile_oracle:") for k in call_counts)):
+            messages.append({"role": "user", "content": _ORACLE_NO_COMPILE_NUDGE})
+            trace_lines.append(f"[no-compile nudge — turn {turn + 1}]\n{textwrap.indent(_ORACLE_NO_COMPILE_NUDGE, '  ')}\n")
+            no_compile_warned[0] = True
+
+        if NUDGE_EVERY_N_TURNS and (turn + 1) % NUDGE_EVERY_N_TURNS == 0:
+            messages.append({"role": "user", "content": _ORACLE_NUDGE})
+            trace_lines.append(f"[nudge — turn {turn + 1}]\n{textwrap.indent(_ORACLE_NUDGE, '  ')}\n")
 
     else:
         # All 20 turns used — ask once if more time is needed.
@@ -1192,6 +1372,16 @@ def generate_with_agent(
 
                 trace_lines.append(f"[assistant — ext turn {ext_turn + 1}, {len(tool_calls)} tool call(s)]")
                 messages.extend(_run_tool_calls(tool_calls))
+
+                if (NO_COMPILE_AFTER and not no_compile_warned[0]
+                        and not any(k.startswith("compile_oracle:") for k in call_counts)):
+                    messages.append({"role": "user", "content": _ORACLE_NO_COMPILE_NUDGE})
+                    trace_lines.append(f"[no-compile nudge — ext turn {ext_turn + 1}]\n{textwrap.indent(_ORACLE_NO_COMPILE_NUDGE, '  ')}\n")
+                    no_compile_warned[0] = True
+
+                if NUDGE_EVERY_N_TURNS and (ext_turn + 1) % NUDGE_EVERY_N_TURNS == 0:
+                    messages.append({"role": "user", "content": _ORACLE_NUDGE})
+                    trace_lines.append(f"[nudge — ext turn {ext_turn + 1}]\n{textwrap.indent(_ORACLE_NUDGE, '  ')}\n")
             else:
                 trace_lines.append("[agent] Extension exhausted without final answer.\n")
 
@@ -1235,4 +1425,6 @@ def generate_with_agent(
             for p in unanswered:
                 print(f"  {p}")
 
-    return oracle_code, "\n".join(trace_lines)
+    text = trace_lines.text()
+    trace_lines.close()
+    return oracle_code, text

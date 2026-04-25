@@ -14,6 +14,25 @@ from ..oracle.agent import (
     OLLAMA_CHAT_URL, TOOLS, _dispatch,
     _EXTENSION_TURNS, _MAX_EXTENSIONS, _EXTENSION_PROMPT,
     _tool_resolve_includes, _has_unresolved_includes,
+    _TraceWriter,
+    _chat,
+    NUDGE_EVERY_N_TURNS,
+    NO_COMPILE_AFTER,
+)
+
+# Format-reminder nudge (injected every NUDGE_EVERY_N_TURNS turns).
+_TEST_NUDGE = (
+    "Reminder: when you stop calling tools, your final reply must be a "
+    "single ```cpp fenced block containing the complete test.cc. "
+    "If you have a working draft, call compile_test now to validate it."
+)
+
+_TEST_NO_COMPILE_NUDGE = (
+    "WARNING: you have not attempted compile_test yet. "
+    "Stop researching and DRAFT your best test.cc now, then call "
+    "compile_test. The compiler's error messages are far more useful "
+    "than further speculation. Failures are expected — you have multiple "
+    "retries to fix them. Action over analysis."
 )
 from ..oracle.notes import load_notes, render_notes_for_prompt
 from ..oracle.runner.results import OracleResult
@@ -172,21 +191,6 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
     return compile_handler, run_handler, get_errors_handler
 
 
-def _chat(messages: list[dict], model: str, tools: list[dict]) -> dict:
-    payload = json.dumps({
-        "model":    model,
-        "messages": messages,
-        "tools":    tools,
-        "stream":   False,
-        "think":    True,
-    }).encode()
-    req = urllib.request.Request(
-        OLLAMA_CHAT_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        return json.loads(resp.read())
 
 
 def generate_test_with_agent(
@@ -274,15 +278,17 @@ def generate_test_with_agent(
         f"=== USER ===\n{user_content}\n"
     )
 
-    trace_lines: list[str] = [
-        "=== TEST AGENT TRACE ===\n",
-        f"[user]\n{textwrap.indent(user_content, '  ')}\n",
-    ]
+    trace_lines = _TraceWriter(test_subdir / "agent_trace.txt")
+    trace_lines.append("=== TEST AGENT TRACE ===\n")
+    trace_lines.append(f"[user]\n{textwrap.indent(user_content, '  ')}\n")
 
     test_code: str | None = None
     last_draft: list[str | None] = [None]
     call_counts: dict[str, int] = {}
+    tool_cache: dict[str, str] = {}
     REPEAT_LIMIT = 3
+    NO_CACHE = {"compile_test", "run_test", "get_compile_errors", "leave_note"}
+    no_compile_warned = [False]
 
     def _save_draft(code: str) -> None:
         if code and len(code) > 100 and "#include" in code:
@@ -304,6 +310,15 @@ def generate_test_with_agent(
             hash_args = {k: v for k, v in args.items() if k != "code"}
             key = f"{name}:{json.dumps(hash_args, sort_keys=True)}"
             call_counts[key] = call_counts.get(key, 0) + 1
+            if name not in NO_CACHE and key in tool_cache:
+                cached = tool_cache[key]
+                note = (
+                    "(cached — you already called this with the same arguments. "
+                    "Use the answer below; do not re-query.)\n"
+                )
+                trace_lines.append(f"  → [cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
+                results.append({"role": "tool", "content": note + cached})
+                continue
             if call_counts[key] > REPEAT_LIMIT and name not in ("compile_test", "run_test"):
                 nudge = (
                     f"You have called {name} with these arguments {call_counts[key]} times. "
@@ -327,6 +342,8 @@ def generate_test_with_agent(
                 f"  → {name}({json.dumps(args) if name != 'compile_test' else '{...}'})"
             )
             trace_lines.append(textwrap.indent(result_text, "      ") + "\n")
+            if name not in NO_CACHE:
+                tool_cache[key] = result_text
             results.append({"role": "tool", "content": result_text})
         return results
 
@@ -370,6 +387,17 @@ def generate_test_with_agent(
             f"[assistant — turn {turn + 1}, {len(tool_calls)} tool call(s)]"
         )
         messages.extend(_run_tool_calls(tool_calls))
+
+        if (NO_COMPILE_AFTER and not no_compile_warned[0]
+                and (turn + 1) >= NO_COMPILE_AFTER
+                and not any(k.startswith("compile_test:") for k in call_counts)):
+            messages.append({"role": "user", "content": _TEST_NO_COMPILE_NUDGE})
+            trace_lines.append(f"[no-compile nudge — turn {turn + 1}]\n{textwrap.indent(_TEST_NO_COMPILE_NUDGE, '  ')}\n")
+            no_compile_warned[0] = True
+
+        if NUDGE_EVERY_N_TURNS and (turn + 1) % NUDGE_EVERY_N_TURNS == 0:
+            messages.append({"role": "user", "content": _TEST_NUDGE})
+            trace_lines.append(f"[nudge — turn {turn + 1}]\n{textwrap.indent(_TEST_NUDGE, '  ')}\n")
 
     else:
         # All 20 turns used — ask once if more time is needed.
@@ -422,6 +450,16 @@ def generate_test_with_agent(
                     f"[assistant — ext turn {ext_turn + 1}, {len(tool_calls)} tool call(s)]"
                 )
                 messages.extend(_run_tool_calls(tool_calls))
+
+                if (NO_COMPILE_AFTER and not no_compile_warned[0]
+                        and not any(k.startswith("compile_test:") for k in call_counts)):
+                    messages.append({"role": "user", "content": _TEST_NO_COMPILE_NUDGE})
+                    trace_lines.append(f"[no-compile nudge — ext turn {ext_turn + 1}]\n{textwrap.indent(_TEST_NO_COMPILE_NUDGE, '  ')}\n")
+                    no_compile_warned[0] = True
+
+                if NUDGE_EVERY_N_TURNS and (ext_turn + 1) % NUDGE_EVERY_N_TURNS == 0:
+                    messages.append({"role": "user", "content": _TEST_NUDGE})
+                    trace_lines.append(f"[nudge — ext turn {ext_turn + 1}]\n{textwrap.indent(_TEST_NUDGE, '  ')}\n")
             else:
                 trace_lines.append("[agent] Extension exhausted without final answer.\n")
 
@@ -452,4 +490,6 @@ def generate_test_with_agent(
                 if _is_usable(last_draft[0]):
                     test_code = last_draft[0]
 
-    return test_code, "\n".join(trace_lines)
+    text = trace_lines.text()
+    trace_lines.close()
+    return test_code, text

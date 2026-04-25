@@ -22,10 +22,53 @@ from ..oracle.agent import (
     _EXTENSION_TURNS, _MAX_EXTENSIONS, _EXTENSION_PROMPT,
     _tool_resolve_includes, _has_unresolved_includes,
     _tool_grep_codebase,
+    _TraceWriter,
+    _chat,
+    NUDGE_EVERY_N_TURNS,
+    NO_COMPILE_AFTER,
+)
+
+# Format-reminder nudge (injected every NUDGE_EVERY_N_TURNS turns) — keeps
+# the output-format spec near the end of the context where attention is
+# strongest. The gemmi port has the strictest format requirement of the
+# three agents (two or three labelled fenced blocks), so a tighter reminder
+# pays for itself.
+_GEMMI_NUDGE = (
+    "Reminder: when you stop calling tools, your final reply must be exactly "
+    "two or three fenced code blocks, labelled:\n"
+    "  ```cpp:function.hh\n  ...\n  ```\n"
+    "  ```cpp:function.cc          (optional — only if needed)\n  ...\n  ```\n"
+    "  ```cpp:test.cc\n  ...\n  ```\n"
+    "Do not summarise. Do not narrate. If you have a working draft, call "
+    "compile_gemmi NOW to validate it before finalising."
+)
+
+_GEMMI_NO_COMPILE_NUDGE = (
+    "WARNING: you have not attempted compile_gemmi yet. "
+    "Stop researching and DRAFT your best function.hh + test.cc (and "
+    "optionally function.cc) NOW, then call compile_gemmi. The compiler's "
+    "error messages are far more useful than further speculation about "
+    "gemmi APIs. Failures are expected — you have multiple retries to fix "
+    "them. Action over analysis."
 )
 from ..oracle.compile import GEMMI_INCLUDE
 from ..oracle.notes import load_notes, render_notes_for_prompt
 from .compile import MAX_COMPILE_ATTEMPTS, compile_gemmi, run_gemmi_test_binary
+
+# Absolute paths to data files (pdb/cif/mtz/map/ent) inside the original test
+# source. These fixtures are validated by the oracle stage and MUST carry over
+# to the gemmi test verbatim — surfacing them in the prompt prevents the agent
+# from spending tool calls on inspect_pdb / grep_codebase to "verify" them.
+_FIXTURE_PATH_RE = re.compile(r'"(/[^"\s]+\.(?:pdb|cif|mmcif|ent|mtz|map))"')
+
+
+def _extract_test_fixtures(test_cc: str) -> list[str]:
+    seen: list[str] = []
+    for m in _FIXTURE_PATH_RE.finditer(test_cc):
+        path = m.group(1)
+        if path not in seen:
+            seen.append(path)
+    return seen
 
 GEMMI_CHEAT_SHEET = """\
 ## gemmi quick reference (verified against the installed headers)
@@ -276,15 +319,6 @@ def _make_tool_handlers(gemmi_subdir: Path) -> tuple[callable, callable, callabl
     return compile_handler, run_handler, get_errors_handler
 
 
-def _chat(messages: list[dict], model: str, tools: list[dict]) -> dict:
-    payload = json.dumps({"model": model, "messages": messages,
-                          "tools": tools, "stream": False, "think": True}).encode()
-    req = urllib.request.Request(OLLAMA_CHAT_URL, data=payload,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        return json.loads(resp.read())
-
-
 _BLOCK_RE = re.compile(
     r"```(?:cpp|c\+\+)?(?::([^\n]+))?\n(.*?)```",
     re.DOTALL,
@@ -361,6 +395,14 @@ def generate_gemmi_port_with_agent(
         "before finalising."
     )
 
+    fixtures = _extract_test_fixtures(original_test_cc)
+    if fixtures:
+        parts.append(
+            "## Test fixtures (use these paths VERBATIM in the gemmi test — "
+            "do NOT call inspect_pdb or grep_codebase to verify them)"
+        )
+        parts.append("\n".join(f"  - {p}" for p in fixtures))
+
     parts.append("## Original MMDB function")
     parts.append(f"```cpp\n{original_function_src.rstrip()}\n```")
 
@@ -392,15 +434,17 @@ def generate_gemmi_port_with_agent(
         f"=== USER ===\n{user_content}\n"
     )
 
-    trace_lines: list[str] = [
-        "=== GEMMI COMBINED AGENT TRACE ===\n",
-        f"[user]\n{textwrap.indent(user_content, '  ')}\n",
-    ]
+    trace_lines = _TraceWriter(gemmi_subdir / "agent_trace.txt")
+    trace_lines.append("=== GEMMI COMBINED AGENT TRACE ===\n")
+    trace_lines.append(f"[user]\n{textwrap.indent(user_content, '  ')}\n")
 
     final_blocks: dict[str, str] | None = None
     last_draft: list[dict[str, str] | None] = [None]
     call_counts: dict[str, int] = {}
+    tool_cache: dict[str, str] = {}
     REPEAT_LIMIT = 3
+    NO_CACHE = {"compile_gemmi", "run_gemmi_test", "get_compile_errors", "leave_note"}
+    no_compile_warned = [False]
 
     def _save_draft_from_compile(args: dict) -> None:
         hh = args.get("function_hh") or ""
@@ -430,6 +474,15 @@ def generate_gemmi_port_with_agent(
                          if k not in ("function_hh", "function_cc", "test_cc")}
             key = f"{name}:{json.dumps(hash_args, sort_keys=True)}"
             call_counts[key] = call_counts.get(key, 0) + 1
+            if name not in NO_CACHE and key in tool_cache:
+                cached = tool_cache[key]
+                note = (
+                    "(cached — you already called this with the same arguments. "
+                    "Use the answer below; do not re-query.)\n"
+                )
+                trace_lines.append(f"  → [cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
+                results.append({"role": "tool", "content": note + cached})
+                continue
             if call_counts[key] > REPEAT_LIMIT and name not in ("compile_gemmi", "run_gemmi_test"):
                 nudge = (
                     f"You have called {name} with these arguments {call_counts[key]} times. "
@@ -452,6 +505,8 @@ def generate_gemmi_port_with_agent(
                 f"  → {name}({json.dumps(args) if name != 'compile_gemmi' else '{...}'})"
             )
             trace_lines.append(textwrap.indent(result_text, "      ") + "\n")
+            if name not in NO_CACHE:
+                tool_cache[key] = result_text
             results.append({"role": "tool", "content": result_text})
         return results
 
@@ -477,6 +532,17 @@ def generate_gemmi_port_with_agent(
             break
         trace_lines.append(f"[assistant — turn {turn + 1}, {len(tool_calls)} tool call(s)]")
         messages.extend(_run_tool_calls(tool_calls))
+
+        if (NO_COMPILE_AFTER and not no_compile_warned[0]
+                and (turn + 1) >= NO_COMPILE_AFTER
+                and not any(k.startswith("compile_gemmi:") for k in call_counts)):
+            messages.append({"role": "user", "content": _GEMMI_NO_COMPILE_NUDGE})
+            trace_lines.append(f"[no-compile nudge — turn {turn + 1}]\n{textwrap.indent(_GEMMI_NO_COMPILE_NUDGE, '  ')}\n")
+            no_compile_warned[0] = True
+
+        if NUDGE_EVERY_N_TURNS and (turn + 1) % NUDGE_EVERY_N_TURNS == 0:
+            messages.append({"role": "user", "content": _GEMMI_NUDGE})
+            trace_lines.append(f"[nudge — turn {turn + 1}]\n{textwrap.indent(_GEMMI_NUDGE, '  ')}\n")
     else:
         trace_lines.append("[agent] Turn limit reached.\n")
 
@@ -504,4 +570,6 @@ def generate_gemmi_port_with_agent(
             if _is_usable(last_draft[0]):
                 final_blocks = last_draft[0]
 
-    return final_blocks, "\n".join(trace_lines)
+    text = trace_lines.text()
+    trace_lines.close()
+    return final_blocks, text
