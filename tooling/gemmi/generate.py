@@ -64,9 +64,13 @@ def generate_gemmi(
         if conn is None:
             _conn.close()
 
+    # Always persist the trace — it's the primary debugging artifact, and
+    # without it a failed run leaves nothing behind but prompt.txt.
+    gemmi_subdir.mkdir(parents=True, exist_ok=True)
+    (gemmi_subdir / "agent_trace.txt").write_text(trace)
+
     if blocks is None:
         raise RuntimeError("Agent produced no usable port.")
 
     test_cc = _write_files(oracle_dir, blocks)
-    (gemmi_subdir / "agent_trace.txt").write_text(trace)
     return test_cc

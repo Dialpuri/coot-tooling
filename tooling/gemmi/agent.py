@@ -21,33 +21,118 @@ from ..oracle.agent import (
     OLLAMA_CHAT_URL, TOOLS, _dispatch,
     _EXTENSION_TURNS, _MAX_EXTENSIONS, _EXTENSION_PROMPT,
     _tool_resolve_includes, _has_unresolved_includes,
+    _tool_grep_codebase,
 )
+from ..oracle.compile import GEMMI_INCLUDE
 from ..oracle.notes import load_notes, render_notes_for_prompt
 from .compile import MAX_COMPILE_ATTEMPTS, compile_gemmi, run_gemmi_test_binary
 
-GEMMI_SYSTEM_PROMPT = """\
+GEMMI_CHEAT_SHEET = """\
+## gemmi quick reference (verified against the installed headers)
+
+Headers you will almost certainly need:
+  #include <gemmi/model.hpp>      // Structure, Model, Chain, Residue, Atom, CRA
+  #include <gemmi/pdb.hpp>        // read_pdb_file(path)
+  #include <gemmi/mmread.hpp>     // read_structure(path)  — auto-detects format
+  #include <gemmi/neighbor.hpp>   // NeighborSearch
+  #include <gemmi/contact.hpp>    // ContactSearch, for_each_contact
+  #include <gemmi/math.hpp>       // Vec3, Position (Position is a Vec3 of doubles)
+  #include <gemmi/unitcell.hpp>   // UnitCell, Fractional, Position helpers
+
+Loading a PDB — this is the only idiom that works:
+  gemmi::Structure st = gemmi::read_pdb_file("/abs/path/to/file.pdb");
+  st.setup_entities();  // populate entity_type on residues (required by some APIs)
+
+Traversal — every level is a std::vector, so you iterate, not GetXxx():
+  for (gemmi::Model&   model   : st.models)
+  for (gemmi::Chain&   chain   : model.chains)
+  for (gemmi::Residue& residue : chain.residues)
+  for (gemmi::Atom&    atom    : residue.atoms) { ... }
+
+Key MMDB → gemmi accessor map (use these VERBATIM — do not invent variants):
+  mol->GetModel(1)                → st.models[0]            // 0-indexed!
+  chain->GetChainID()             → chain.name              // field, not method
+  residue->GetResName()           → residue.name            // field
+  residue->GetSeqNum()            → residue.seqid.num.value // .seqid is ResidueId base
+  residue->GetInsCode()           → residue.seqid.icode     // char, not const char*
+  atom->GetAtomName()             → atom.name               // std::string field
+  atom->GetElementName()          → atom.element.name()
+  atom->x, atom->y, atom->z       → atom.pos.x, atom.pos.y, atom.pos.z
+  atom->occupancy                 → atom.occ
+  atom->tempFactor                → atom.b_iso
+  chain->GetNumberOfResidues()    → chain.residues.size()
+  residue->GetNumberOfAtoms()     → residue.atoms.size()
+
+No gemmi equivalents exist for MMDB selection / Manager.Select / NewSelection —
+iterate manually, or use gemmi::NeighborSearch for distance queries.
+
+NeighborSearch — distance queries against a Model:
+  gemmi::NeighborSearch ns(st.models[0], st.cell, /*max_radius=*/5.0);
+  ns.populate(/*include_h=*/false);   // MUST call before any find_*
+  std::vector<gemmi::NeighborSearch::Mark*> hits =
+      ns.find_atoms(atom.pos, /*alt=*/'\\0', /*min_dist=*/0.0, /*radius=*/4.0);
+  for (auto* m : hits) {
+      gemmi::CRA cra = m->to_cra(st.models[0]);   // gives chain/residue/atom
+      // cra.chain, cra.residue, cra.atom are POINTERS (may be nullptr)
+  }
+
+ContactSearch — pairs of atoms within a radius:
+  gemmi::ContactSearch cs(/*search_radius=*/4.0);
+  cs.ignore = gemmi::ContactSearch::Ignore::SameResidue;  // or AdjacentResidues, SameChain, SameAsu, Nothing
+  cs.setup_atomic_radii(1.0, 0.0);                        // optional, for VdW-aware filtering
+  std::vector<gemmi::ContactSearch::Result> contacts = cs.find_contacts(ns);
+  for (const auto& c : contacts) {
+      // c.partner1, c.partner2 are CRA; c.dist_sq is double; c.image_idx is int
+  }
+
+CRA shape (gemmi/model.hpp):
+  struct CRA { Chain* chain; Residue* residue; Atom* atom; };  // ALL POINTERS
+
+There is NO top-level <gemmi.hpp>. There is NO atom.get_pos() or st.n_atoms().
+Vec3 operator* is component-wise; for dot product use v.dot(w); for squared
+length use v.length_sq().
+
+Everything above is in code_graph.db — lookup_type("gemmi::NeighborSearch"),
+list_methods("gemmi::ContactSearch"), find_symbol("read_pdb_file"), etc. will
+show the real API. Some signatures involving std::string / std::vector may
+appear as "int" in the DB summary due to a libclang template-resolution quirk;
+when in doubt, read the header directly from /opt/homebrew/include/gemmi/
+with read_file or grep_codebase (the gemmi tree is searched alongside coot).
+"""
+
+GEMMI_SYSTEM_PROMPT = f"""\
 You are porting ONE C++ function from the MMDB API to the gemmi API AND
 translating its Google Test, in the same session.
 
-Produce three artifacts:
+{GEMMI_CHEAT_SHEET}
+
+## Artifacts to produce
+
   A. function.hh — header with declaration and #include <gemmi/...> deps.
      Use `#pragma once`. If the body is short, put it here as `inline`.
   B. function.cc — OPTIONAL. Only emit if the body is long or uses
      translation-unit-private helpers. Otherwise omit it entirely.
   C. test.cc — the gemmi-translated Google Test, #include "function.hh".
 
-Rules:
-1. FREEZE every EXPECT_* / ASSERT_* line from the original test. Expected
-   values are the correctness oracle. Do not edit numbers or comparisons.
-2. Translate only setup (PDB loading, iteration, types) and the call site.
-3. Port the function semantics 1:1 — same output for the same input.
-4. The function signature must match what test.cc calls. Design them together.
-5. Use find_symbol / get_type / grep_codebase to verify every gemmi name
-   before using it. Do not invent APIs.
+## Rules
+
+1. Preserve every EXPECT_* / ASSERT_* line's semantic fact — same compared
+   value, same comparison operator. You MAY rewrite the left-hand-side
+   accessor when the type changes (e.g. `res->GetSeqNum()` becomes
+   `res->seqid.num.value`), but you MAY NOT change the expected value or
+   relax the check. The original expected numbers are the correctness
+   oracle.
+2. Port the function semantics 1:1 — same output for the same input.
+3. The function signature must match what test.cc calls. Design them together.
+4. Use the DB tools (lookup_type, list_methods, find_header, find_symbol)
+   BEFORE writing any gemmi name. When lookup_type reports an ambiguous
+   name, retry with the fully-qualified form. Do not invent APIs.
+5. grep_codebase searches both coot and the gemmi header tree — use it
+   when you need to see a usage pattern.
 6. Link target: test.cc (+ function.cc if present) against -lgemmi_cpp and
    -lgtest. No MMDB, no clipper, no coot libraries.
 7. Call compile_gemmi with your drafts. Fix errors until it builds. Then
-   call run_gemmi_test to confirm assertions pass. Max 4 compile attempts.
+   call run_gemmi_test to confirm assertions pass. Max {MAX_COMPILE_ATTEMPTS} compile attempts.
 
 Final output format (ONE response, THREE fenced blocks in this exact order):
 
@@ -256,30 +341,45 @@ def generate_gemmi_port_with_agent(
             return run_handler()
         if name == "get_compile_errors":
             return get_errors_handler()
+        # Widen grep to include the gemmi header tree — most API discovery
+        # during a port needs to see gemmi usage, which isn't in PROJECT_ROOT.
+        if name == "grep_codebase":
+            return _tool_grep_codebase(
+                args["pattern"],
+                args.get("glob"),
+                extra_roots=[GEMMI_INCLUDE],
+            )
         return _dispatch(conn, name, args)
 
-    notes_block = ""
+    parts: list[str] = []
+
+    parts.append("## Task")
+    parts.append(
+        f"Port `{function_qname}` to gemmi AND translate its MMDB test in one "
+        "pass. Design the gemmi function signature and the test's call site "
+        "together. Use the tools to resolve gemmi types. Compile and run "
+        "before finalising."
+    )
+
+    parts.append("## Original MMDB function")
+    parts.append(f"```cpp\n{original_function_src.rstrip()}\n```")
+
+    parts.append("## Original MMDB test")
+    parts.append("_FREEZE every `EXPECT_*` — keep the assertions identical._")
+    parts.append(f"```cpp\n{original_test_cc.rstrip()}\n```")
+
     notes = load_notes(gemmi_subdir.parent / "oracle" / "notes.json")
     if notes:
         rendered = render_notes_for_prompt(notes, audience="gemmi")
         if rendered:
-            notes_block = (
-                "\n\nOracle stage recorded these validated facts — carry them "
-                "over where they still apply, and treat the port caveats as "
-                "concrete design hints:\n" + rendered + "\n"
+            parts.append("## Validated facts from oracle stage")
+            parts.append(
+                "_Carry these over where they still apply; treat port caveats "
+                "as concrete design hints._"
             )
+            parts.append(f"```\n{rendered.rstrip()}\n```")
 
-    user_content = (
-        f"Port `{function_qname}` to gemmi AND translate its MMDB test in one "
-        "pass.\n\n"
-        f"Original MMDB function:\n```cpp\n{original_function_src}\n```\n\n"
-        f"Original MMDB test (FREEZE every EXPECT_*):\n"
-        f"```cpp\n{original_test_cc}\n```"
-        + notes_block
-        + "\n\nDesign the gemmi function signature and the test's call site "
-        "together. Use the tools to resolve gemmi types. Compile and run "
-        "before finalising."
-    )
+    user_content = "\n\n".join(parts)
 
     messages: list[dict] = [
         {"role": "system", "content": GEMMI_SYSTEM_PROMPT},

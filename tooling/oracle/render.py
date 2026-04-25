@@ -108,6 +108,8 @@ INCLUDE_ROOTS = [
     "/opt/homebrew/Cellar/clipper4coot/2.1.20180802_3/include",
     "/opt/homebrew/opt/gemmi/include",
     "/opt/homebrew/include",
+    "/opt/homebrew/include/gemmi",
+    "/opt/homebrew/Cellar/gemmi/0.7.5/include"
 ]
 
 _TEST_DATA_DIR = Path(__file__).parent.parent / "test-data"
@@ -335,21 +337,32 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
     callers = get_callers_with_source(conn, fn["id"], limit=3)
 
     # ---- Assemble context block ----
-    ctx: list[str] = []
+    # Each code chunk is wrapped in its own ```cpp fence, with plain-text
+    # markdown headings between them so section structure is visually
+    # distinct from C++ content.
+    parts: list[str] = []
 
-    ctx.append("// === INCLUDES ===")
-    for inc in sorted(headers):
-        ctx.append(f'#include "{inc}"')
+    def section(heading: str, code: str, *, note: str | None = None) -> None:
+        parts.append(f"## {heading}")
+        if note:
+            parts.append(note)
+        parts.append(f"```cpp\n{code.rstrip()}\n```")
 
+    # Includes
+    section("Includes", "\n".join(f'#include "{inc}"' for inc in sorted(headers)))
+
+    # Containing class
     if containing_class:
-        ctx.append(f"\n// === CONTAINING CLASS: {containing_class['qualified_name']} ===")
-        ctx.append(_render_type(
-            conn,
-            containing_class["qualified_name"],
-            containing_class["summary"] or "",
-            called_by_type.get(containing_class["qualified_name"], set()),
-            compact=True,
-        ))
+        section(
+            f"Containing class: `{containing_class['qualified_name']}`",
+            _render_type(
+                conn,
+                containing_class["qualified_name"],
+                containing_class["summary"] or "",
+                called_by_type.get(containing_class["qualified_name"], set()),
+                compact=True,
+            ),
+        )
 
     # Containing class constructor callers — shows how to instantiate this class.
     # A hand-curated override file takes precedence over the automated DB lookup.
@@ -357,44 +370,53 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
         cls_qname = containing_class["qualified_name"]
         override = _load_override(cls_qname)
         if override:
-            ctx.append(f"\n// === {cls_qname} CONSTRUCTION (curated) ===")
-            ctx.append(override.rstrip())
+            section(f"`{cls_qname}` construction (curated)", override)
         else:
             ctor_callers = get_constructor_callers(conn, cls_qname)
             if ctor_callers:
-                ctx.append(f"\n// === {cls_qname} CONSTRUCTOR CALLERS ===")
+                parts.append(f"## `{cls_qname}` constructor callers")
                 for ctor_caller in ctor_callers:
                     rel = ctor_caller["file"].replace(PROJECT_ROOT + "/", "")
-                    ctx.append(f"\n// {rel}")
+                    parts.append(f"**{rel}**")
                     if ctor_caller["comment"]:
-                        ctx.append(f"// {ctor_caller['comment']}")
-                    ctx.append(ctor_caller["source_code"].rstrip())
+                        parts.append(f"_{ctor_caller['comment']}_")
+                    parts.append(f"```cpp\n{ctor_caller['source_code'].rstrip()}\n```")
 
+    # Types used in the function body
     if used_types:
-        ctx.append("\n// === TYPES USED IN FUNCTION ===")
+        rendered_types: list[tuple[dict, str]] = []
         for t in used_types:
             if containing_class and t["qualified_name"] == containing_class["qualified_name"]:
                 continue
             if return_type_row and t["qualified_name"] == return_type_row["qualified_name"]:
-                continue  # rendered separately below
-            ctx.append(f"\n// [{t['kind']}] {t['qualified_name']}")
-            ctx.append(_render_type(
+                continue
+            rendered = _render_type(
                 conn,
                 t["qualified_name"],
                 t["summary"] or "",
                 called_by_type.get(t["qualified_name"], set()),
                 compact=True,
-            ))
+            )
+            rendered_types.append((t, rendered))
 
+        if rendered_types:
+            parts.append("## Types used in function")
+            for t, rendered in rendered_types:
+                parts.append(f"**[{t['kind']}] `{t['qualified_name']}`**")
+                parts.append(f"```cpp\n{rendered.rstrip()}\n```")
+
+    # Return type
     if return_type_row:
-        ctx.append(f"\n// === RETURN TYPE: {return_type_row['qualified_name']} ===")
-        ctx.append(_render_type(
-            conn,
-            return_type_row["qualified_name"],
-            return_type_row["summary"] or "",
-            called_methods=None,   # show all methods — these are the oracle's output accessors
-            compact=True,
-        ))
+        section(
+            f"Return type: `{return_type_row['qualified_name']}`",
+            _render_type(
+                conn,
+                return_type_row["qualified_name"],
+                return_type_row["summary"] or "",
+                called_methods=None,   # show all methods — these are the oracle's output accessors
+                compact=True,
+            ),
+        )
 
     # MMDB hierarchy — always show the traversal path when MMDB types are involved
     all_type_qnames: set[str] = {t["qualified_name"] for t in used_types}
@@ -405,13 +427,14 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
 
     mmdb_section = _mmdb_navigation_section(conn, all_type_qnames, headers)
     if mmdb_section:
-        ctx.append("\n// === MMDB NAVIGATION HIERARCHY ===")
-        ctx.append(mmdb_section)
+        section("MMDB navigation hierarchy", mmdb_section)
 
+    # Example callers
     if callers:
-        ctx.append("\n// === EXAMPLE CALLERS ===")
+        parts.append("## Example callers")
+        parts.append("_Reference only — do NOT copy verbatim. See ACCESS RULES above._")
         target_class = containing_class["qualified_name"] if containing_class else None
-        for caller in callers:
+        for i, caller in enumerate(callers, 1):
             rel = caller["file"].replace(PROJECT_ROOT + "/", "")
             caller_cls = get_containing_class(conn, caller["qualified_name"])
             caller_cls_qname = caller_cls["qualified_name"] if caller_cls else None
@@ -419,20 +442,39 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
                 target_class is not None
                 and caller_cls_qname == target_class
             )
-            tag = " [in-class caller — has private access, oracle does NOT]" if in_class else ""
-            ctx.append(f"\n// {rel}{tag}")
+            access_note = (
+                "in-class member — has PRIVATE access, oracle does NOT"
+                if in_class else
+                "external caller — public API only"
+            )
+
+            parts.append(f"### Caller {i}/{len(callers)}: `{caller['qualified_name']}`")
+            meta = [
+                f"- **File:** `{rel}`",
+            ]
+            if caller_cls_qname:
+                meta.append(f"- **Class:** `{caller_cls_qname}`")
+            meta.append(f"- **Access:** {access_note}")
             if caller["comment"]:
-                ctx.append(f"// {caller['comment']}")
+                meta.append(f"- **Doc:** {caller['comment']}")
+            parts.append("\n".join(meta))
+
             fields = caller_class_fields(conn, caller["qualified_name"])
             if fields:
-                ctx.append(fields)
-            ctx.append(caller["source_code"].rstrip())
+                parts.append(f"```cpp\n{fields.rstrip()}\n```")
 
-    ctx.append("\n// === FUNCTION TO OBSERVE ===")
+            parts.append(f"```cpp\n{caller['source_code'].rstrip()}\n```")
+
+    # Function to observe
+    parts.append("## Function to observe")
     if fn["comment"]:
-        ctx.append(f"// {fn['comment']}")
-    ctx.append(fn["source_code"] or f"// (no source available) {fn['display_name']}")
+        parts.append(f"_{fn['comment']}_")
+    parts.append(
+        "```cpp\n"
+        + (fn["source_code"] or f"// (no source available) {fn['display_name']}").rstrip()
+        + "\n```"
+    )
 
-    context_block = "\n".join(ctx)
+    context_block = "\n\n".join(parts)
 
-    return f"{ORACLE_INSTRUCTIONS}\n\n```cpp\n{context_block}\n```\n"
+    return f"{ORACLE_INSTRUCTIONS}\n\n{context_block}\n"

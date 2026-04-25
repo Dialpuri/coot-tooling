@@ -214,52 +214,54 @@ def generate_test_with_agent(
             return get_errors_handler()
         return _dispatch(conn, name, args)
 
+    parts: list[str] = []
+
+    parts.append("## Oracle program")
+    parts.append(f"```cpp\n{oracle_cc_text.rstrip()}\n```")
+
     # Format structured cases
     if oracle_result.cases:
-        cases_text = f"Oracle produced {len(oracle_result.cases)} test case(s):\n"
+        parts.append(f"## Oracle cases ({len(oracle_result.cases)})")
+        case_lines: list[str] = []
         for i, case in enumerate(oracle_result.cases, 1):
-            cases_text += f"\nCase {i}:\n"
+            case_lines.append(f"Case {i}:")
             for k, v in case["inputs"].items():
-                cases_text += f"  INPUT  {k}: {v}\n"
+                case_lines.append(f"  INPUT  {k}: {v}")
             for k, v in case["outputs"].items():
-                cases_text += f"  OUTPUT {k}: {v}\n"
+                case_lines.append(f"  OUTPUT {k}: {v}")
+        parts.append("```\n" + "\n".join(case_lines) + "\n```")
     else:
-        cases_text = f"Observed output when run:\n{oracle_result.stdout}\n"
-        cases_text += "There may be warnings at the top — the INPUT/OUTPUT lines are the ground truth.\n"
+        parts.append("## Observed output when run")
+        parts.append("_INPUT/OUTPUT lines are the ground truth; ignore any leading warnings._")
+        parts.append(f"```\n{oracle_result.stdout.rstrip()}\n```")
 
     # Compact oracle trace summary (tool calls only)
-    trace_summary = ""
     if oracle_trace:
         tool_lines = [l.strip() for l in oracle_trace.splitlines() if l.strip().startswith("→")]
         if tool_lines:
-            trace_summary = (
-                "\nOracle agent confirmed these lookups during generation "
-                "(types/headers already verified):\n"
-                + "\n".join(f"  {l}" for l in tool_lines[:20])
-            )
-            if len(tool_lines) > 20:
-                trace_summary += f"\n  ... ({len(tool_lines) - 20} more)"
+            parts.append("## Oracle lookups already verified")
+            parts.append("_Types and headers confirmed during oracle generation._")
+            shown = tool_lines[:20]
+            suffix = f"\n... ({len(tool_lines) - 20} more)" if len(tool_lines) > 20 else ""
+            parts.append("```\n" + "\n".join(shown) + suffix + "\n```")
 
     # Oracle-derived notes, if the oracle stage produced any.
-    notes_block = ""
     notes = load_notes(test_subdir.parent / "oracle" / "notes.json")
     if notes:
         rendered = render_notes_for_prompt(notes, audience="test")
         if rendered:
-            notes_block = (
-                "\n\nOracle stage recorded these validated facts — reuse them:\n"
-                + rendered + "\n"
-            )
+            parts.append("## Validated facts from oracle stage")
+            parts.append("_Reuse these verbatim rather than re-deriving._")
+            parts.append(f"```\n{rendered.rstrip()}\n```")
 
-    user_content = (
-        f"Here is the oracle program:\n\n```cpp\n{oracle_cc_text}\n```\n\n"
-        + cases_text
-        + trace_summary
-        + notes_block
-        + "\n\nConvert this into a Google Test suite. Use the tools to verify "
+    parts.append("## Task")
+    parts.append(
+        "Convert the oracle into a Google Test suite. Use the tools to verify "
         "headers, look up any types you are unsure about, then compile and run "
         "before finalising."
     )
+
+    user_content = "\n\n".join(parts)
 
     messages: list[dict] = [
         {"role": "system", "content": TEST_SYSTEM_PROMPT},

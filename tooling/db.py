@@ -76,6 +76,27 @@ def get_type(conn: sqlite3.Connection, type_qname: str) -> sqlite3.Row | None:
     """, (f"%::{short}",)).fetchone()
 
 
+def get_types_matching(conn: sqlite3.Connection, name: str) -> list[sqlite3.Row]:
+    """Return every type matching `name` — either the exact qualified name or,
+    for bare names with no "::", every row whose qualified_name ends in "::name".
+
+    Used to detect ambiguity (e.g. 'Residue' matches both mmdb::Residue and
+    gemmi::Residue) so the agent can be asked to qualify its lookup.
+    """
+    if "::" in name:
+        return conn.execute("""
+            SELECT t.qualified_name, t.kind, t.summary, fi.path AS file
+            FROM types t JOIN files fi ON fi.id = t.file_id
+            WHERE t.qualified_name = ?
+        """, (name,)).fetchall()
+    return conn.execute("""
+        SELECT t.qualified_name, t.kind, t.summary, fi.path AS file
+        FROM types t JOIN files fi ON fi.id = t.file_id
+        WHERE t.qualified_name = ? OR t.qualified_name LIKE ?
+        ORDER BY t.qualified_name
+    """, (name, f"%::{name}")).fetchall()
+
+
 def get_type_methods(conn: sqlite3.Connection, type_qname: str) -> list[sqlite3.Row]:
     return conn.execute("""
         SELECT display_name, comment

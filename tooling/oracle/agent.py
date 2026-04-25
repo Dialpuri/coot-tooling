@@ -25,9 +25,11 @@ from ..db import (
     PROJECT_ROOT,
     get_function,
     get_type,
+    get_types_matching,
     get_type_methods,
     get_callers_with_source,
     get_class_functions,
+    get_containing_class,
 )
 from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNIPPET, caller_class_fields
 
@@ -63,12 +65,13 @@ Mandatory steps before outputting the final program:
   d. Fix any runtime errors or missing output, recompile, and re-run.
   e. Only then output the final program in a ```cpp block.
 
-Use C++ code where possible, avoid C style code.\
+Use C++ code where possible, avoid C style code. Compile your draft as soon as reasonable. 
+Don't keep trying to refine if the output is useful.\
 """
 
-_MAX_COMPILE_ATTEMPTS = 3
-_EXTENSION_TURNS = 10
-_MAX_EXTENSIONS  = 1
+_MAX_COMPILE_ATTEMPTS = 5
+_EXTENSION_TURNS = 20
+_MAX_EXTENSIONS  = 2
 _EXTENSION_PROMPT = (
     "You have used all available turns. "
     "If you still need to compile, run, or fix errors, respond with tool calls "
@@ -383,7 +386,7 @@ ORACLE_TOOLS = TOOLS + [_COMPILE_ORACLE_TOOL, _RUN_ORACLE_TOOL]
 def _tool_read_file(path: str, offset: int = 0, limit: int = 300) -> str:
     real = Path(path).resolve()
     if not any(str(real).startswith(root) for root in ALLOWED_READ_ROOTS):
-        return f"ERROR: path '{path}' is outside allowed roots."
+        return f"ERROR: path '{path}' is outside allowed roots. {ALLOWED_READ_ROOTS=} {real=}"
     try:
         text = real.read_text(errors="replace")
     except OSError as e:
@@ -410,7 +413,20 @@ def _tool_lookup_function(conn: sqlite3.Connection, qualified_name: str) -> str:
 
 
 def _tool_lookup_type(conn: sqlite3.Connection, name: str) -> str:
-    row = get_type(conn, name)
+    # Disambiguate bare names: 'Residue' exists in mmdb, gemmi, coot and more;
+    # silently picking one arbitrary hit is how the agent ends up inventing
+    # methods on the wrong type. When multiple candidates exist, show them
+    # and let the next call use a qualified name.
+    candidates = get_types_matching(conn, name)
+    if len(candidates) > 1:
+        lines = [
+            f"Type '{name}' is ambiguous — {len(candidates)} matches. "
+            "Call lookup_type again with a fully-qualified name:",
+        ]
+        for c in candidates:
+            lines.append(f"  {c['qualified_name']:40s}  ({c['file']})")
+        return "\n".join(lines)
+    row = candidates[0] if candidates else get_type(conn, name)
     if not row:
         return f"Type '{name}' not found in DB."
     methods = get_type_methods(conn, row["qualified_name"])
@@ -570,9 +586,29 @@ def _tool_search_functions(conn: sqlite3.Connection, name_fragment: str) -> str:
         WHERE qualified_name LIKE ?
         LIMIT 30
     """, (f"%{name_fragment}%",)).fetchall()
-    if not rows:
-        return f"No functions matching '{name_fragment}'."
-    return "\n".join(r[0] for r in rows)
+    if rows:
+        return "\n".join(r[0] for r in rows)
+
+    # Zero hits — common cause is a wrong namespace prefix (e.g. searching
+    # 'coot::molecules_container_t::' when the class is actually global).
+    # Retry with just the tail after the last '::' and, if THAT matches,
+    # return the results with a heads-up.
+    if "::" in name_fragment:
+        tail = name_fragment.rsplit("::", 1)[-1] or name_fragment.rsplit("::", 2)[-2]
+        if tail and tail != name_fragment:
+            retry = conn.execute("""
+                SELECT DISTINCT qualified_name FROM functions
+                WHERE qualified_name LIKE ?
+                LIMIT 30
+            """, (f"%{tail}%",)).fetchall()
+            if retry:
+                return (
+                    f"No matches for '{name_fragment}'. The namespace prefix "
+                    f"may be wrong — showing matches for '{tail}' instead "
+                    f"(verify the qualified name before using):\n"
+                    + "\n".join(r[0] for r in retry)
+                )
+    return f"No functions matching '{name_fragment}'."
 
 
 _GREP_EXTS = {".cc", ".cpp", ".cxx", ".c", ".h", ".hh", ".hpp", ".hxx"}
@@ -638,9 +674,14 @@ def _grep_files(pattern: str, roots: list[str], glob: str | None, max_matches: i
     return results
 
 
-def _tool_grep_codebase(pattern: str, glob: str | None = None) -> str:
+def _tool_grep_codebase(
+    pattern: str,
+    glob: str | None = None,
+    extra_roots: list[str] | None = None,
+) -> str:
     MAX = 101
-    matches = _grep_files(pattern, [PROJECT_ROOT], glob, MAX)
+    roots = [PROJECT_ROOT] + (extra_roots or [])
+    matches = _grep_files(pattern, roots, glob, MAX)
     if not matches:
         return f"No matches for pattern '{pattern}'."
     if matches[0].startswith("ERROR:"):
@@ -934,47 +975,67 @@ def generate_with_agent(
     if not fn:
         return None, "Function not found in DB."
 
-    user_content = (
-        f"FUNCTION TO OBSERVE: {function_qname}\n\n"
-        f"File: {fn['file']}\n\n"
-    )
+    # Resolve caller class context once so we can tag in-class members.
+    target_class = function_qname.rsplit("::", 1)[0] if "::" in function_qname else None
+
+    parts: list[str] = []
+
+    parts.append(f"## Function to observe: `{function_qname}`")
+    meta = [f"- **File:** `{fn['file']}`"]
     if fn["comment"]:
-        user_content += f"// {fn['comment']}\n"
-    user_content += fn["source_code"] or "(no source)"
+        meta.append(f"- **Doc:** {fn['comment']}")
+    parts.append("\n".join(meta))
+    parts.append(f"```cpp\n{(fn['source_code'] or '(no source)').rstrip()}\n```")
 
     # Always include the MMDB Manager usage snippet — ReadCoorFile is an
     # external library not in the DB, so the agent can't find it via tools.
-    user_content += "\n\n// === MMDB USAGE ===\n" + MMDB_MANAGER_SNIPPET
+    parts.append("## MMDB usage")
+    parts.append(f"```cpp\n{MMDB_MANAGER_SNIPPET.rstrip()}\n```")
 
     # Inject callers up-front so the agent sees real usage before reasoning
     # about unknown parameter types.
     callers = get_callers_with_source(conn, fn["id"], limit=3)
     if callers:
-        user_content += "\n\n// === EXAMPLE CALLERS ==="
-        for c in callers:
+        parts.append("## Example callers")
+        parts.append("_Reference only — do NOT copy private-member access into oracle.cc._")
+        for i, c in enumerate(callers, 1):
             rel = c["file"].replace(PROJECT_ROOT + "/", "")
-            user_content += f"\n\n// {rel}"
+            caller_cls = get_containing_class(conn, c["qualified_name"])
+            caller_cls_qname = caller_cls["qualified_name"] if caller_cls else None
+            in_class = target_class is not None and caller_cls_qname == target_class
+            access_note = (
+                "in-class member — has PRIVATE access, oracle does NOT"
+                if in_class else
+                "external caller — public API only"
+            )
+            parts.append(f"### Caller {i}/{len(callers)}: `{c['qualified_name']}`")
+            caller_meta = [f"- **File:** `{rel}`"]
+            if caller_cls_qname:
+                caller_meta.append(f"- **Class:** `{caller_cls_qname}`")
+            caller_meta.append(f"- **Access:** {access_note}")
             if c["comment"]:
-                user_content += f"\n// {c['comment']}"
+                caller_meta.append(f"- **Doc:** {c['comment']}")
+            parts.append("\n".join(caller_meta))
+
             fields = caller_class_fields(conn, c["qualified_name"])
             if fields:
-                user_content += "\n" + fields
-            user_content += "\n" + c["source_code"].rstrip()
+                parts.append(f"```cpp\n{fields.rstrip()}\n```")
+            parts.append(f"```cpp\n{c['source_code'].rstrip()}\n```")
 
     # Load any curated notes (questions + answers) left by previous runs.
     notes_context = _load_notes()
     if notes_context:
-        user_content += "\n\n// === DOMAIN NOTES ===\n" + notes_context
+        parts.append("## Domain notes")
+        parts.append(f"```\n{notes_context.rstrip()}\n```")
 
     # Attach the curated construction snippet for the containing class if one exists.
-    if "::" in function_qname:
-        class_qname = function_qname.rsplit("::", 1)[0]
-        override = _load_override(class_qname)
+    if target_class:
+        override = _load_override(target_class)
         if override:
-            user_content += (
-                f"\n\n// === HOW TO CONSTRUCT {class_qname} ===\n"
-                + override.rstrip()
-            )
+            parts.append(f"## How to construct `{target_class}`")
+            parts.append(f"```cpp\n{override.rstrip()}\n```")
+
+    user_content = "\n\n".join(parts)
 
     messages: list[dict] = [
         {"role": "system", "content": AGENT_SYSTEM_PROMPT},
