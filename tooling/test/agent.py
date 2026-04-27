@@ -16,6 +16,7 @@ from ..oracle.agent import (
     _tool_resolve_includes, _has_unresolved_includes,
     _TraceWriter,
     _chat,
+    _is_degenerate_thinking,
     NUDGE_EVERY_N_TURNS,
     NO_COMPILE_AFTER,
 )
@@ -375,6 +376,13 @@ def generate_test_with_agent(
             trace_lines.append(
                 f"[thinking — turn {turn + 1}]\n{textwrap.indent(thinking, '  ')}\n"
             )
+
+        # Degenerate-thinking guard: pathological repetition has saturated
+        # the response window — abort the loop and let rescue fire clean.
+        degen, diag = _is_degenerate_thinking(thinking)
+        if degen:
+            trace_lines.append(f"[agent] {diag} — aborting loop, will issue rescue.\n")
+            break
 
         if not tool_calls:
             trace_lines.append(

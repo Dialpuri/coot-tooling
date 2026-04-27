@@ -29,6 +29,7 @@ from ..db import (
     get_type_methods,
     get_callers_with_source,
     get_class_functions,
+    get_class_methods_with_access,
     get_containing_class,
 )
 from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNIPPET, caller_class_fields
@@ -50,10 +51,21 @@ OLLAMA_OPTIONS = {
     # (0.9 / 40), keeping the model on-track for structured code output.
     "top_p":          float(os.environ.get("CT_OLLAMA_TOP_P",     0.9)),
     "top_k":          int(os.environ.get("CT_OLLAMA_TOP_K",       20)),
-    # repeat_penalty=1.0 disables ollama's default 1.1 — that default
-    # silently corrupts code where legitimate repetition is structural
-    # (parallel EXPECT_EQ lines, identical #include blocks, twin loops).
-    "repeat_penalty": float(os.environ.get("CT_OLLAMA_REPEAT_PENALTY", 1.0)),
+    # repeat_penalty trades off two failure modes:
+    #   * Too high (>=1.1): silently corrupts code where legitimate repetition
+    #     is structural — parallel EXPECT_EQ lines, identical #include blocks,
+    #     twin loops — by renaming a token in a copy "to be different".
+    #   * Too low (1.0): with low temperature + thinking mode, the model
+    #     locks onto its most recent paragraph and reproduces it verbatim
+    #     hundreds of times until num_ctx is exhausted. Real failure mode
+    #     observed in the wild — see add_neighbor_residues_for_refinement_help
+    #     where a single thinking block reproduced one phrase 116 times.
+    # 1.05 is the sweet spot: enough penalty to break paragraph-scale loops,
+    # too gentle to disrupt 10-token structural repetition. repeat_last_n=256
+    # (vs ollama's default 64) widens the window so paragraph-level repeats
+    # actually fall inside it.
+    "repeat_penalty": float(os.environ.get("CT_OLLAMA_REPEAT_PENALTY", 1.05)),
+    "repeat_last_n":  int(os.environ.get("CT_OLLAMA_REPEAT_LAST_N", 256)),
 }
 
 # Periodic format-reminder cadence. Transformer attention skews toward the
@@ -466,6 +478,45 @@ class _TraceWriter:
             self._fp = None
 
 
+def _is_degenerate_thinking(
+    thinking: str,
+    min_lines: int = 30,
+    min_line_len: int = 25,
+    min_count: int = 8,
+    min_ratio: float = 0.10,
+) -> tuple[bool, str]:
+    """Detect pathological repetition in a thinking block.
+
+    Pathological = a substantive line (≥`min_line_len` chars after strip)
+    appears at least `min_count` times AND ≥`min_ratio` of all substantive
+    lines. The length filter excludes legitimate short repeats like "}" or
+    "Yes.". Calibrated against the real failure case in
+    add_neighbor_residues_for_refinement_help where each of the top four
+    lines repeated ~77× at ~16% — well above this threshold.
+
+    Catches the failure mode where low-temp + low-repeat-penalty + thinking
+    mode causes the model to reproduce one paragraph dozens of times until
+    num_ctx is saturated. When that happens the agent never emits a usable
+    tool call or final block, so we short-circuit straight to rescue.
+    """
+    from collections import Counter
+    lines = [l.strip() for l in thinking.splitlines()
+             if len(l.strip()) >= min_line_len]
+    if len(lines) < min_lines:
+        return False, ""
+    counter = Counter(lines)
+    top_line, top_count = counter.most_common(1)[0]
+    ratio = top_count / len(lines)
+    if top_count >= min_count and ratio >= min_ratio:
+        snippet = (top_line[:80] + "…") if len(top_line) > 80 else top_line
+        return True, (
+            f"Degenerate thinking detected: most-frequent line repeated "
+            f"{top_count}× ({ratio:.0%} of {len(lines)} substantive lines). "
+            f"Sample: {snippet!r}"
+        )
+    return False, ""
+
+
 # ── tool implementations ──────────────────────────────────────────────────────
 
 def _tool_read_file(path: str, offset: int = 0, limit: int = 300) -> str:
@@ -526,10 +577,26 @@ def _tool_lookup_type(conn: sqlite3.Connection, name: str) -> str:
 
 
 def _tool_list_methods(conn: sqlite3.Connection, class_name: str) -> str:
-    qnames = get_class_functions(conn, class_name)
-    if not qnames:
+    """List methods of a class, with access modifiers prefixed.
+
+    The visibility marker matters: without it, the model picks an interesting-
+    looking method, hits a "private member" compile error, and has to grep
+    around to recover. Showing [public]/[private]/[protected] up front lets
+    the model rule out non-callable methods immediately.
+    """
+    rows = get_class_methods_with_access(conn, class_name)
+    if not rows:
         return f"No methods found for '{class_name}'."
-    return "\n".join(qnames)
+    out: list[str] = []
+    for qn, access in rows:
+        marker = f"[{access}]" if access else "[?]"
+        out.append(f"{marker:<11} {qn}")
+    out.append("")
+    out.append(
+        "Only [public] members are callable from outside the class. "
+        "Picking [private] or [protected] will fail to compile."
+    )
+    return "\n".join(out)
 
 
 def _tool_get_callers(conn: sqlite3.Connection, qualified_name: str) -> str:
@@ -817,11 +884,42 @@ def _grep_files(pattern: str, roots: list[str], glob: str | None, max_matches: i
     return results
 
 
+# Patterns the agent reaches for when it's run out of ideas. Each of these
+# would match thousands of unrelated lines and tells the model nothing it
+# couldn't get from a more focused tool. The agent's job at this point is
+# usually visibility/structure analysis — for which list_methods, lookup_type,
+# or get_base_classes is the right tool, not text search.
+_VAGUE_GREP_PATTERNS: dict[str, str] = {
+    "public:":     "use list_methods — it now reports access modifiers directly",
+    "private:":    "use list_methods — it now reports access modifiers directly",
+    "protected:":  "use list_methods — it now reports access modifiers directly",
+    "class ":      "use lookup_type or search_functions for a specific name",
+    "struct ":     "use lookup_type or search_functions for a specific name",
+    "namespace ":  "use lookup_function with the qualified name you suspect",
+    "void ":       "too generic — supply a function or method name to grep for",
+    "int ":        "too generic — supply a function or method name to grep for",
+    "auto ":       "too generic — supply a function or method name to grep for",
+    "return ":     "too generic — supply a function or method name to grep for",
+    "include":     "use find_header or resolve_includes",
+    "#include":    "use find_header or resolve_includes",
+}
+
+
 def _tool_grep_codebase(
     pattern: str,
     glob: str | None = None,
     extra_roots: list[str] | None = None,
 ) -> str:
+    # Reject patterns that match basically everything — they waste tokens
+    # and stall the agent in "I'm out of ideas" mode without useful signal.
+    stripped = pattern.strip()
+    if stripped in _VAGUE_GREP_PATTERNS:
+        return (
+            f"Refusing pattern '{pattern}' — it would match thousands of "
+            f"unrelated lines across the codebase. "
+            f"{_VAGUE_GREP_PATTERNS[stripped]}."
+        )
+
     MAX = 101
     roots = [PROJECT_ROOT] + (extra_roots or [])
     matches = _grep_files(pattern, roots, glob, MAX)
@@ -1306,6 +1404,14 @@ def generate_with_agent(
             if verbose:
                 print(f"\n[thinking]\n{textwrap.indent(thinking, '  ')}\n")
             trace_lines.append(f"[thinking — turn {turn + 1}]\n{textwrap.indent(thinking, '  ')}\n")
+
+        # Degenerate-thinking guard: pathologically repetitive thinking
+        # means the model has burned its output window on garbage and the
+        # rest of this response is unrecoverable.
+        degen, diag = _is_degenerate_thinking(thinking)
+        if degen:
+            trace_lines.append(f"[agent] {diag} — aborting loop, will issue rescue.\n")
+            break
 
         if not tool_calls:
             trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")

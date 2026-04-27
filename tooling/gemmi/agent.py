@@ -24,6 +24,7 @@ from ..oracle.agent import (
     _tool_grep_codebase,
     _TraceWriter,
     _chat,
+    _is_degenerate_thinking,
     NUDGE_EVERY_N_TURNS,
     NO_COMPILE_AFTER,
 )
@@ -166,15 +167,21 @@ translating its Google Test, in the same session.
    relax the check. The original expected numbers are the correctness
    oracle.
 2. Port the function semantics 1:1 — same output for the same input.
-3. The function signature must match what test.cc calls. Design them together.
-4. Use the DB tools (lookup_type, list_methods, find_header, find_symbol)
+3. **Naming**: keep the original function's C++ namespace exactly as-is and
+   append `_gemmi` to the function name. For example, if the original is
+   `coot::angle(...)` the ported function MUST be declared and defined as
+   `coot::angle_gemmi(...)`. Do NOT wrap it in a `gemmi::` namespace or any
+   other namespace. The task below states the exact target name — use it
+   verbatim.
+4. The function signature must match what test.cc calls. Design them together.
+5. Use the DB tools (lookup_type, list_methods, find_header, find_symbol)
    BEFORE writing any gemmi name. When lookup_type reports an ambiguous
    name, retry with the fully-qualified form. Do not invent APIs.
-5. grep_codebase searches both coot and the gemmi header tree — use it
+6. grep_codebase searches both coot and the gemmi header tree — use it
    when you need to see a usage pattern.
-6. Link target: test.cc (+ function.cc if present) against -lgemmi_cpp and
+7. Link target: test.cc (+ function.cc if present) against -lgemmi_cpp and
    -lgtest. No MMDB, no clipper, no coot libraries.
-7. Call compile_gemmi with your drafts. Fix errors until it builds. Then
+8. Call compile_gemmi with your drafts. Fix errors until it builds. Then
    call run_gemmi_test to confirm assertions pass. Max {MAX_COMPILE_ATTEMPTS} compile attempts.
 
 Final output format (ONE response, THREE fenced blocks in this exact order):
@@ -387,12 +394,22 @@ def generate_gemmi_port_with_agent(
 
     parts: list[str] = []
 
+    # Derive the target name: same namespace, function base name + _gemmi suffix.
+    # e.g. "coot::molecule_t::angle" → target "coot::molecule_t::angle_gemmi"
+    _ns_parts = function_qname.rsplit("::", 1)
+    if len(_ns_parts) == 2:
+        _target_name = f"{_ns_parts[0]}::{_ns_parts[1]}_gemmi"
+    else:
+        _target_name = f"{function_qname}_gemmi"
+
     parts.append("## Task")
     parts.append(
         f"Port `{function_qname}` to gemmi AND translate its MMDB test in one "
-        "pass. Design the gemmi function signature and the test's call site "
-        "together. Use the tools to resolve gemmi types. Compile and run "
-        "before finalising."
+        f"pass. The ported function MUST be named **`{_target_name}`** — same "
+        "namespace as the original, with `_gemmi` appended to the function "
+        "name. Do NOT place it inside a `gemmi::` namespace. "
+        "Design the function signature and the test's call site together. "
+        "Use the tools to resolve gemmi types. Compile and run before finalising."
     )
 
     fixtures = _extract_test_fixtures(original_test_cc)
@@ -526,6 +543,18 @@ def generate_gemmi_port_with_agent(
                          "tool_calls": tool_calls})
         if thinking:
             trace_lines.append(f"[thinking — turn {turn + 1}]\n{textwrap.indent(thinking, '  ')}\n")
+
+        # Degenerate-thinking guard: if this turn's thinking is pathologically
+        # repetitive, the model has likely saturated num_ctx with junk and the
+        # rest of the response is unrecoverable. Break out of the loop
+        # immediately and let the rescue prompt have a clean context window.
+        degen, diag = _is_degenerate_thinking(thinking)
+        if degen:
+            trace_lines.append(
+                f"[agent] {diag} — aborting loop, will issue rescue.\n"
+            )
+            break
+
         if not tool_calls:
             trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")
             final_blocks = _extract_blocks(assistant_content) or None

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Full pipeline: generate oracles then tests for all methods in a class.
+Full pipeline: generate oracles then tests for all methods in a class or file.
 
-Usage:
+Usage (class mode):
   # Oracle + test for every method in coot::molecule_t
   python -m tooling.batch "coot::molecule_t"
 
@@ -17,6 +17,13 @@ Usage:
 
   # List matching methods without generating anything
   python -m tooling.batch "coot::molecule_t" --list
+
+Usage (file mode):
+  # Oracle + test + gemmi for every function defined in a source file
+  python -m tooling.batch_file src/coot/molecule.cc
+
+  # Same flags as class mode apply
+  python -m tooling.batch_file src/coot/molecule.cc --agent --workers 4
 """
 from __future__ import annotations
 
@@ -26,10 +33,11 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from .db import connect, get_class_functions, get_internal_call_deps
+from .db import connect, get_class_functions, get_file_functions, get_internal_call_deps
 from .oracle.generate import DEFAULT_MODEL, OUT_ROOT, generate_one, sanitize_name
 from .test.generate import generate_test
 from .gemmi.generate import generate_gemmi
+from .gemmi.aggregate import aggregate_gemmi_files
 
 
 # ── result tracking ───────────────────────────────────────────────────────────
@@ -262,6 +270,107 @@ def main() -> None:
                 print(f"  {r.short}: {status}")
 
     _print_summary(results)
+    if any(not r.skipped and (not r.oracle_ok or not r.test_ok) for r in results):
+        sys.exit(1)
+
+
+def _aggregate(qnames: list[str], source_file: str, with_gemmi: bool) -> None:
+    """Print aggregation results; called at the end of main_file."""
+    if not with_gemmi:
+        return
+    hh, cc = aggregate_gemmi_files(qnames, source_file)
+    print(f"\n[aggregate] {hh}")
+    if cc:
+        print(f"[aggregate] {cc}")
+
+
+def main_file() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run oracle + test + gemmi for every function defined in a source file",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("file", help="Source file path (absolute, or a suffix of the stored path, e.g. src/coot/molecule.cc)")
+    parser.add_argument("--filter",        metavar="STR",  help="Only process functions whose name contains STR")
+    parser.add_argument("--model",         default=DEFAULT_MODEL)
+    parser.add_argument("--agent",         action="store_true",  help="Agentic mode for oracle, test, and gemmi generation")
+    parser.add_argument("--verbose",       action="store_true",  help="Print thinking and tool calls to console")
+    parser.add_argument("--skip-oracle",   action="store_true",  help="Skip oracle generation if oracle.cc already exists")
+    parser.add_argument("--skip-existing", action="store_true",  help="Skip functions that already have oracle.cc")
+    parser.add_argument("--no-gemmi",      action="store_true",  help="Skip gemmi port stage (default: gemmi is run)")
+    parser.add_argument("--no-topo",       action="store_true",  help="Disable bottom-up call-graph ordering")
+    parser.add_argument("--workers",       type=int, default=1, metavar="N",
+                        help="Parallel workers (default 1)")
+    parser.add_argument("--list",          action="store_true",  help="List matching functions and exit")
+    args = parser.parse_args()
+
+    conn = connect()
+    qnames = get_file_functions(conn, args.file)
+    conn.close()
+
+    if not qnames:
+        print(f"No functions found for file: {args.file}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.filter:
+        qnames = [q for q in qnames if args.filter in q]
+        if not qnames:
+            print(f"No functions match filter '{args.filter}'", file=sys.stderr)
+            sys.exit(1)
+
+    if not args.no_topo:
+        if args.workers > 1:
+            print("[warn] --workers > 1 disables call-graph ordering; "
+                  "pass --no-topo to silence this.", file=sys.stderr)
+        else:
+            conn = connect()
+            try:
+                deps = get_internal_call_deps(conn, qnames)
+            finally:
+                conn.close()
+            qnames = topo_order(deps)
+
+    if args.list:
+        for q in qnames:
+            print(q)
+        print(f"\n{len(qnames)} functions")
+        return
+
+    with_gemmi = not args.no_gemmi
+    print(f"Processing {len(qnames)} functions from {args.file} "
+          f"(model={args.model}, workers={args.workers}, agent={args.agent}, gemmi={with_gemmi})")
+
+    results: list[Result] = []
+
+    if args.workers == 1:
+        for i, qname in enumerate(qnames, 1):
+            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]} ...", end=" ", flush=True)
+            r = _process(qname, args.model, args.agent, args.verbose,
+                         args.skip_oracle, args.skip_existing,
+                         with_gemmi=with_gemmi)
+            results.append(r)
+            if r.skipped:
+                print("skipped")
+            elif r.error:
+                print(f"FAILED — {r.error.splitlines()[0]}")
+            else:
+                print("ok")
+    else:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for qname in qnames:
+                f = pool.submit(_process, qname, args.model, args.agent,
+                                args.verbose, args.skip_oracle, args.skip_existing,
+                                with_gemmi)
+                futures[f] = qname
+            for f in as_completed(futures):
+                r = f.result()
+                results.append(r)
+                status = "skipped" if r.skipped else ("ok" if not r.error else "FAILED")
+                print(f"  {r.short}: {status}")
+
+    _print_summary(results)
+    _aggregate(qnames, args.file, with_gemmi)
     if any(not r.skipped and (not r.oracle_ok or not r.test_ok) for r in results):
         sys.exit(1)
 

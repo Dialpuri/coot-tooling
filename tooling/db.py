@@ -137,6 +137,41 @@ def get_class_functions(
     return [r[0] for r in rows]
 
 
+def get_class_methods_with_access(
+    conn: sqlite3.Connection,
+    class_qname: str,
+) -> list[tuple[str, str | None]]:
+    """Return [(qualified_name, access)] for every method in a class.
+
+    Access is one of 'public', 'private', 'protected', or None when libclang
+    couldn't determine it. The result preserves declaration order. When the
+    same qualified_name appears multiple times (decl + definition + override),
+    the most-restrictive non-null access wins so the agent always sees the
+    visibility that actually matters at the call site.
+    """
+    rows = conn.execute("""
+        SELECT qualified_name, access
+        FROM functions
+        WHERE qualified_name LIKE ?
+          AND kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR',
+                       'FUNCTION_TEMPLATE', 'FUNCTION_DECL')
+        ORDER BY line_start
+    """, (f"{class_qname}::%",)).fetchall()
+
+    # Coalesce duplicates, keeping the most-restrictive seen access.
+    rank = {"public": 0, "protected": 1, "private": 2, None: -1}
+    seen: dict[str, str | None] = {}
+    order: list[str] = []
+    for qn, acc in rows:
+        if qn not in seen:
+            seen[qn] = acc
+            order.append(qn)
+        else:
+            if rank.get(acc, -1) > rank.get(seen[qn], -1):
+                seen[qn] = acc
+    return [(qn, seen[qn]) for qn in order]
+
+
 def get_constructor_callers(
     conn: sqlite3.Connection,
     type_qname: str,
@@ -158,6 +193,28 @@ def get_constructor_callers(
         ORDER BY LENGTH(f.source_code) ASC
         LIMIT ?
     """, (ctor_qname, limit)).fetchall()
+
+
+def get_file_functions(
+    conn: sqlite3.Connection,
+    file_path: str,
+) -> list[str]:
+    """Return qualified names of all functions/methods defined in a source file.
+
+    file_path may be an absolute path or a suffix of the stored path
+    (e.g. "src/coot/molecule.cc" will match the full stored path).
+    """
+    rows = conn.execute("""
+        SELECT DISTINCT f.qualified_name
+        FROM functions f
+        JOIN files fi ON fi.id = f.file_id
+        WHERE (fi.path = ? OR fi.path LIKE ?)
+          AND f.kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR',
+                         'FUNCTION_TEMPLATE', 'FUNCTION_DECL')
+          AND f.is_definition = 1
+        ORDER BY f.line_start
+    """, (file_path, f"%/{file_path}")).fetchall()
+    return [r[0] for r in rows]
 
 
 def get_internal_call_deps(
