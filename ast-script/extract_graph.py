@@ -27,6 +27,7 @@ import clang.cindex
 # ---------------------------------------------------------------------------
 LIBCLANG     = "/opt/homebrew/opt/llvm/lib/libclang.dylib"
 RESOURCE_DIR = "/opt/homebrew/opt/llvm/lib/clang/22"
+SYSROOT      = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
 COMPILE_DB   = Path(__file__).parent.parent / "ast-data" / "compile_commands.json"
 OUTPUT_DB    = Path(__file__).parent.parent / "ast-data" / "code_graph.db"
 PROJECT_ROOT = "/Users/dialpuri/lmb/coot"
@@ -120,7 +121,7 @@ def clean_args(args: list[str], file_path: str) -> list[str]:
         if "$$" in a or "\\$$" in a:
             continue
         cleaned.append(a)
-    cleaned += ["-resource-dir", RESOURCE_DIR]
+    cleaned += ["-resource-dir", RESOURCE_DIR, "-isysroot", SYSROOT]
     return cleaned
 
 
