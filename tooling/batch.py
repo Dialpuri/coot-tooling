@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 from .db import connect, get_class_functions, get_file_functions, get_internal_call_deps
@@ -80,6 +82,12 @@ def topo_order(deps: dict[str, set[str]]) -> list[str]:
 
 # ── per-function worker ───────────────────────────────────────────────────────
 
+def _is_complete(out_dir: Path) -> bool:
+    """Return True if the function already has gemmi/function.hh and gemmi/test.cc."""
+    return (out_dir / "gemmi" / "function.hh").exists() and \
+           (out_dir / "gemmi" / "test.cc").exists()
+
+
 def _process(
     qname: str,
     model: str,
@@ -88,55 +96,93 @@ def _process(
     skip_oracle: bool,
     skip_existing: bool,
     with_gemmi: bool = False,
+    overwrite: bool = False,
 ) -> Result:
     r = Result(qname)
     out_dir = OUT_ROOT / sanitize_name(qname)
     oracle_cc = out_dir / "oracle" / "oracle.cc"
 
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / "batch.log"
+
+    def log(msg: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)
+        with log_path.open("a") as f:
+            f.write(line + "\n")
+
+    log(f"START {qname}")
+
+    # ── completion check ──────────────────────────────────────────────────────
+    if not overwrite and _is_complete(out_dir):
+        log("SKIP — already complete (gemmi/function.hh + gemmi/test.cc exist)")
+        r.skipped = True
+        return r
+
     # ── oracle phase ──────────────────────────────────────────────────────────
-    if skip_oracle and oracle_cc.exists():
-        r.oracle_ok = True  # treat pre-existing oracle as success
+    oracle_result_json = out_dir / "oracle" / "result.json"
+    if not overwrite and oracle_result_json.exists():
+        log("oracle: skipped (result.json exists)")
+        r.oracle_ok = True
+    elif skip_oracle and oracle_cc.exists():
+        log("oracle: skipped (oracle.cc exists)")
+        r.oracle_ok = True
     elif skip_existing and oracle_cc.exists():
+        log("oracle: skipped (--skip-existing)")
         r.skipped = True
         return r
     else:
+        log("oracle: generating ...")
         conn = connect()
         try:
             result_dir = generate_one(
-                conn, qname, model=model, agent=agent, verbose=verbose,
+                conn, qname, model=model, verbose=verbose,
             )
         except urllib.error.URLError as e:
+            log(f"oracle: FAILED — Ollama unreachable: {e}")
             r.error = f"Ollama unreachable: {e}"
+            return r
+        except Exception as e:
+            log(f"oracle: FAILED — {e}\n{traceback.format_exc()}")
+            r.error = f"oracle failed: {e}"
             return r
         finally:
             conn.close()
 
         if result_dir is None:
+            log("oracle: FAILED — not found in DB")
             r.error = "not found in DB"
             return r
 
+        log("oracle: ok")
         r.oracle_ok = True
 
     # ── test phase ────────────────────────────────────────────────────────────
+    log("test: generating ...")
     try:
-        generate_test(
-            out_dir, model=model, agent=agent, verbose=verbose,
-        )
+        generate_test(out_dir, model=model, agent=agent, verbose=verbose)
+        log("test: ok")
         r.test_ok = True
     except Exception as e:
+        log(f"test: FAILED — {e}\n{traceback.format_exc()}")
         r.test_ok = False
         r.error = f"test generation failed: {e}"
         return r
 
     # ── gemmi port phase (optional) ───────────────────────────────────────────
     if with_gemmi:
+        log("gemmi: generating ...")
         try:
             generate_gemmi(out_dir, qname, model=model, verbose=verbose)
+            log("gemmi: ok")
             r.gemmi_ok = True
         except Exception as e:
+            log(f"gemmi: FAILED — {e}\n{traceback.format_exc()}")
             r.gemmi_ok = False
             r.error = f"gemmi port failed: {e}"
 
+    log(f"DONE oracle={r.oracle_ok} test={r.test_ok} gemmi={r.gemmi_ok}")
     return r
 
 
@@ -199,6 +245,8 @@ def main() -> None:
                              "are already converted by the time their callers are processed)")
     parser.add_argument("--workers",       type=int, default=1, metavar="N",
                         help="Parallel workers (default 1)")
+    parser.add_argument("--overwrite",     action="store_true",
+                        help="Re-run all stages even if gemmi/function.hh + gemmi/test.cc already exist")
     parser.add_argument("--list",          action="store_true", help="List matching methods and exit")
     args = parser.parse_args()
 
@@ -244,24 +292,18 @@ def main() -> None:
 
     if args.workers == 1:
         for i, qname in enumerate(qnames, 1):
-            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]} ...", end=" ", flush=True)
+            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]}", flush=True)
             r = _process(qname, args.model, args.agent, args.verbose,
                          args.skip_oracle, args.skip_existing,
-                         with_gemmi=args.with_gemmi)
+                         with_gemmi=args.with_gemmi, overwrite=args.overwrite)
             results.append(r)
-            if r.skipped:
-                print("skipped")
-            elif r.error:
-                print(f"FAILED — {r.error.splitlines()[0]}")
-            else:
-                print("ok")
     else:
         futures = {}
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             for qname in qnames:
                 f = pool.submit(_process, qname, args.model, args.agent,
                                 args.verbose, args.skip_oracle, args.skip_existing,
-                                args.with_gemmi)
+                                args.with_gemmi, args.overwrite)
                 futures[f] = qname
             for f in as_completed(futures):
                 r = f.result()
@@ -292,6 +334,7 @@ def main_file() -> None:
     )
     parser.add_argument("file", help="Source file path (absolute, or a suffix of the stored path, e.g. src/coot/molecule.cc)")
     parser.add_argument("--filter",        metavar="STR",  help="Only process functions whose name contains STR")
+    parser.add_argument("--mmdb-only",     action="store_true", help="Only process functions that use MMDB types (mmdb::*)")
     parser.add_argument("--model",         default=DEFAULT_MODEL)
     parser.add_argument("--agent",         action="store_true",  help="Agentic mode for oracle, test, and gemmi generation")
     parser.add_argument("--verbose",       action="store_true",  help="Print thinking and tool calls to console")
@@ -301,11 +344,13 @@ def main_file() -> None:
     parser.add_argument("--no-topo",       action="store_true",  help="Disable bottom-up call-graph ordering")
     parser.add_argument("--workers",       type=int, default=1, metavar="N",
                         help="Parallel workers (default 1)")
+    parser.add_argument("--overwrite",     action="store_true",
+                        help="Re-run all stages even if gemmi/function.hh + gemmi/test.cc already exist")
     parser.add_argument("--list",          action="store_true",  help="List matching functions and exit")
     args = parser.parse_args()
 
     conn = connect()
-    qnames = get_file_functions(conn, args.file)
+    qnames = get_file_functions(conn, args.file, mmdb_only=args.mmdb_only)
     conn.close()
 
     if not qnames:
@@ -344,24 +389,18 @@ def main_file() -> None:
 
     if args.workers == 1:
         for i, qname in enumerate(qnames, 1):
-            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]} ...", end=" ", flush=True)
+            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]}", flush=True)
             r = _process(qname, args.model, args.agent, args.verbose,
                          args.skip_oracle, args.skip_existing,
-                         with_gemmi=with_gemmi)
+                         with_gemmi=with_gemmi, overwrite=args.overwrite)
             results.append(r)
-            if r.skipped:
-                print("skipped")
-            elif r.error:
-                print(f"FAILED — {r.error.splitlines()[0]}")
-            else:
-                print("ok")
     else:
         futures = {}
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             for qname in qnames:
                 f = pool.submit(_process, qname, args.model, args.agent,
                                 args.verbose, args.skip_oracle, args.skip_existing,
-                                with_gemmi)
+                                with_gemmi, args.overwrite)
                 futures[f] = qname
             for f in as_completed(futures):
                 r = f.result()

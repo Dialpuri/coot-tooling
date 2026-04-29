@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 DB_PATH      = Path(__file__).parent.parent / "ast-data" / "code_graph.db"
-PROJECT_ROOT = "/Users/dialpuri/lmb/coot"
+PROJECT_ROOT = "/lmb/home/jdialpuri/Development/coot-dev/coot"
 
 
 def connect() -> sqlite3.Connection:
@@ -198,22 +198,38 @@ def get_constructor_callers(
 def get_file_functions(
     conn: sqlite3.Connection,
     file_path: str,
+    mmdb_only: bool = False,
 ) -> list[str]:
     """Return qualified names of all functions/methods defined in a source file.
 
     file_path may be an absolute path or a suffix of the stored path
     (e.g. "src/coot/molecule.cc" will match the full stored path).
+    If mmdb_only is True, only return functions that use at least one mmdb:: type.
     """
-    rows = conn.execute("""
-        SELECT DISTINCT f.qualified_name
-        FROM functions f
-        JOIN files fi ON fi.id = f.file_id
-        WHERE (fi.path = ? OR fi.path LIKE ?)
-          AND f.kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR',
-                         'FUNCTION_TEMPLATE', 'FUNCTION_DECL')
-          AND f.is_definition = 1
-        ORDER BY f.line_start
-    """, (file_path, f"%/{file_path}")).fetchall()
+    if mmdb_only:
+        rows = conn.execute("""
+            SELECT DISTINCT f.qualified_name
+            FROM functions f
+            JOIN files fi ON fi.id = f.file_id
+            JOIN uses_type u ON u.function_id = f.id
+            WHERE (fi.path = ? OR fi.path LIKE ?)
+              AND f.kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR',
+                             'FUNCTION_TEMPLATE', 'FUNCTION_DECL')
+              AND f.is_definition = 1
+              AND u.type_qualified_name LIKE 'mmdb::%'
+            ORDER BY f.line_start
+        """, (file_path, f"%/{file_path}")).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT DISTINCT f.qualified_name
+            FROM functions f
+            JOIN files fi ON fi.id = f.file_id
+            WHERE (fi.path = ? OR fi.path LIKE ?)
+              AND f.kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR',
+                             'FUNCTION_TEMPLATE', 'FUNCTION_DECL')
+              AND f.is_definition = 1
+            ORDER BY f.line_start
+        """, (file_path, f"%/{file_path}")).fetchall()
     return [r[0] for r in rows]
 
 

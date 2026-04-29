@@ -64,12 +64,12 @@ Rules:
 Mandatory steps before outputting the final program:
 6. Call resolve_includes on your draft FIRST to verify every #include "..."
    header resolves correctly. Fix any that do not.
-7. Call compile_test with your draft. Fix all compiler errors and call again
-   until it succeeds (max 3 attempts). If compilation fails with a long error
-   log, call get_compile_errors to see the full output.
-8. Once it compiles, call run_test to check for assertion failures. Fix any
-   mismatches and recompile.
-9. Output only the final, compiling and passing C++ source in a single ```cpp
+7. Call compile_test with your draft. It compiles and immediately runs the
+   tests — you will see both compiler output and test results in one response.
+   If compilation fails, fix the errors and call again. If tests FAIL, fix
+   the assertions and call compile_test again. Keep iterating until all tests
+   PASS. Call get_compile_errors if the log is truncated.
+8. Output only the final, compiling and passing C++ source in a single ```cpp
    block.\
 """
 
@@ -169,7 +169,15 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
 
         if success:
             last_binary[0] = test_bin
-            return f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS})."
+            run_ok, run_out = run_test_binary(test_bin)
+            run_lines = run_out.splitlines()
+            if len(run_lines) > 100:
+                run_out = "\n".join(run_lines[:100]) + f"\n... ({len(run_lines) - 100} more lines)"
+            status = "All tests PASSED." if run_ok else "Some tests FAILED — fix the assertions and recompile."
+            return (
+                f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}).\n"
+                f"{status}\n{run_out}"
+            )
         last_binary[0] = None
         last_error_log[0] = error_log
         return f"Compilation FAILED (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}):\n{output}"
@@ -224,21 +232,9 @@ def generate_test_with_agent(
     parts.append("## Oracle program")
     parts.append(f"```cpp\n{oracle_cc_text.rstrip()}\n```")
 
-    # Format structured cases
-    if oracle_result.cases:
-        parts.append(f"## Oracle cases ({len(oracle_result.cases)})")
-        case_lines: list[str] = []
-        for i, case in enumerate(oracle_result.cases, 1):
-            case_lines.append(f"Case {i}:")
-            for k, v in case["inputs"].items():
-                case_lines.append(f"  INPUT  {k}: {v}")
-            for k, v in case["outputs"].items():
-                case_lines.append(f"  OUTPUT {k}: {v}")
-        parts.append("```\n" + "\n".join(case_lines) + "\n```")
-    else:
-        parts.append("## Observed output when run")
-        parts.append("_INPUT/OUTPUT lines are the ground truth; ignore any leading warnings._")
-        parts.append(f"```\n{oracle_result.stdout.rstrip()}\n```")
+    parts.append("## Observed output when run")
+    parts.append("_INPUT/OUTPUT lines are the ground truth; ignore any leading warnings._")
+    parts.append(f"```\n{oracle_result.stdout.rstrip()}\n```")
 
     # Compact oracle trace summary (tool calls only)
     if oracle_trace:

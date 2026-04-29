@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from ..db import connect, get_function
-from .compile import write_compile_script
+from .compile import compile_gemmi, run_gemmi_test_binary, write_compile_script
 
 DEFAULT_MODEL = "qwen3:30b"
 
@@ -72,5 +72,36 @@ def generate_gemmi(
     if blocks is None:
         raise RuntimeError("Agent produced no usable port.")
 
+    # Verify before committing files to disk — if compile or run fails the
+    # gemmi/ dir won't contain function.hh + test.cc, so _is_complete stays
+    # False and the next batch run will retry rather than skip.
+    import tempfile, shutil
+    gemmi_subdir = oracle_dir / "gemmi"
+    gemmi_subdir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tmp_hh   = tmp_path / "function.hh"
+        tmp_test = tmp_path / "test.cc"
+        tmp_cc   = tmp_path / "function.cc"
+        tmp_bin  = tmp_path / "test"
+
+        tmp_hh.write_text(blocks["function.hh"])
+        tmp_test.write_text(blocks["test.cc"])
+        has_cc = "function.cc" in blocks and blocks["function.cc"].strip()
+        if has_cc:
+            tmp_cc.write_text(blocks["function.cc"])
+
+        ok, output = compile_gemmi(tmp_test, tmp_bin, tmp_cc if has_cc else None)
+        (gemmi_subdir / "compile.log").write_text(output)
+        if not ok:
+            raise RuntimeError(f"gemmi test compile failed:\n{output[:500]}")
+
+        ok, output = run_gemmi_test_binary(tmp_bin)
+        (gemmi_subdir / "run.log").write_text(output)
+        if not ok:
+            raise RuntimeError(f"gemmi test failed:\n{output[:500]}")
+
+    # Tests passed — write final files and compile script.
     test_cc = _write_files(oracle_dir, blocks)
     return test_cc

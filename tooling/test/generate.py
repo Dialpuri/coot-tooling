@@ -9,22 +9,27 @@ import urllib.request
 from pathlib import Path
 
 from ..oracle.runner.results import OracleResult, load_result, parse_output
-from .compile import make_test_compile_cmd, write_compile_script
+from .compile import compile_test_cc, run_test_binary, write_compile_script
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL   = "gemma4:31b"
+DEFAULT_MODEL   = "qwen3.6"
 
 _SYSTEM_PROMPT = """\
 You are converting a C++ oracle program into a Google Test suite.
 
 Rules:
 1. Keep all setup code (loading PDB/MTZ, constructing objects, calling the function) identical.
-2. Replace every `std::cout << "OUTPUT ..." << std::endl;` with an EXPECT_EQ or EXPECT_TRUE/EXPECT_FALSE assertion.
-   Use the observed values supplied by the user as the expected values.
+2. Replace every `std::cout << "OUTPUT ..." << std::endl;` with an assertion:
+   - For floating-point values: use EXPECT_NEAR(actual, expected, tol) where tol is a small relative
+     tolerance (e.g. 1e-4 * |expected|, minimum 1e-9). Never use EXPECT_DOUBLE_EQ or hardcoded
+     truncated literals — always compute expected from the formula or use the full-precision value.
+   - For integers or exact strings: use EXPECT_EQ.
+   - For booleans: use EXPECT_TRUE / EXPECT_FALSE.
 3. Wrap everything in a single TEST(OracleTest, FunctionName) block.
 4. Add the required Google Test headers and a main() that calls RUN_ALL_TESTS().
 5. Remove all INPUT/OUTPUT std::cout lines — only keep the assertion logic.
-6. Output only the complete C++ source in a single ```cpp block, no explanation.\
+6. Do not #include .cc files — only #include headers (.hh/.h).
+7. Output only the complete C++ source in a single ```cpp block, no explanation.\
 """
 
 
@@ -79,6 +84,23 @@ def _write_test_files(oracle_dir: Path, test_src: str) -> Path:
     return test_cc
 
 
+def _compile_and_run(test_cc: Path) -> None:
+    """Compile and run test.cc, writing compile.log and run.log. Raises on failure."""
+    test_bin = test_cc.parent / "test"
+    compile_log = test_cc.parent / "compile.log"
+    run_log     = test_cc.parent / "run.log"
+
+    ok, output = compile_test_cc(test_cc, test_bin)
+    compile_log.write_text(output)
+    if not ok:
+        raise RuntimeError(f"test.cc compile failed:\n{output[:500]}")
+
+    ok, output = run_test_binary(test_bin)
+    run_log.write_text(output)
+    if not ok:
+        raise RuntimeError(f"test binary failed:\n{output[:500]}")
+
+
 def generate_test(
     oracle_dir: Path,
     model: str = DEFAULT_MODEL,
@@ -124,6 +146,7 @@ def generate_test(
 
         test_cc = _write_test_files(oracle_dir, test_src)
         (oracle_dir / "test" / "agent_trace.txt").write_text(trace)
+        _compile_and_run(test_cc)
         return test_cc
 
     # Non-agentic single-shot generation.

@@ -27,7 +27,7 @@ DEFAULT_DB         = Path(__file__).parent.parent / "ast-data" / "code_graph.db"
 DEFAULT_INDEX      = Path(__file__).parent.parent / "ast-data" / "index.faiss"
 DEFAULT_META       = Path(__file__).parent.parent / "ast-data" / "index_meta.json"
 DEFAULT_MODEL      = "google/embeddinggemma-300m"
-DEFAULT_BATCH_SIZE = 64
+DEFAULT_BATCH_SIZE = 32
 MAX_CODE_CHARS     = 3000
 
 

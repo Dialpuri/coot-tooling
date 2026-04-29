@@ -104,12 +104,7 @@ _MMDB_ORDER.update({qname: i + 1 for i, (qname, _) in enumerate(MMDB_HIERARCHY)}
 
 INCLUDE_ROOTS = [
     PROJECT_ROOT,
-    "/opt/homebrew/Cellar/mmdb2/2.0.22/include",
-    "/opt/homebrew/Cellar/clipper4coot/2.1.20180802_3/include",
-    "/opt/homebrew/opt/gemmi/include",
-    "/opt/homebrew/include",
-    "/opt/homebrew/include/gemmi",
-    "/opt/homebrew/Cellar/gemmi/0.7.5/include"
+    "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
 ]
 
 _TEST_DATA_DIR = Path(__file__).parent.parent / "test-data"

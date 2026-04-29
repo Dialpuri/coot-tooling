@@ -136,12 +136,32 @@ There is NO top-level <gemmi.hpp>. There is NO atom.get_pos() or st.n_atoms().
 Vec3 operator* is component-wise; for dot product use v.dot(w); for squared
 length use v.length_sq().
 
+Extended type → header map (include the listed header for the named type):
+  gemmi::Element                    → <gemmi/elem.hpp>
+  gemmi::EntityType, PolymerType    → <gemmi/model.hpp>
+  gemmi::ResidueId, SeqId           → <gemmi/model.hpp>
+  gemmi::Fractional                 → <gemmi/unitcell.hpp>
+  gemmi::Transform, Mat33           → <gemmi/math.hpp>
+  gemmi::Span<T>                    → <gemmi/span.hpp>
+  gemmi::SubChain                   → <gemmi/model.hpp>
+  gemmi::SmallStructure             → <gemmi/small.hpp>
+  gemmi::Mtz, MtzDataset            → <gemmi/mtz.hpp>
+  gemmi::GridBase, Grid<T>          → <gemmi/grid.hpp>
+  gemmi::Ccp4<T>                    → <gemmi/ccp4.hpp>
+  gemmi::read_ccp4_map              → <gemmi/ccp4.hpp>
+  gemmi::read_mtz_file              → <gemmi/mtz.hpp>
+  gemmi::ChemComp, Restraints       → <gemmi/chemcomp.hpp>
+  gemmi::MonLib                     → <gemmi/monlib.hpp>
+  gemmi::Topo                       → <gemmi/topo.hpp>
+  gemmi::DsspMaker                  → <gemmi/dssp.hpp>
+  gemmi::PolyHeur                   → <gemmi/polyheur.hpp>
+
 Everything above is in code_graph.db — lookup_type("gemmi::NeighborSearch"),
 list_methods("gemmi::ContactSearch"), find_symbol("read_pdb_file"), etc. will
 show the real API. Some signatures involving std::string / std::vector may
 appear as "int" in the DB summary due to a libclang template-resolution quirk;
-when in doubt, read the header directly from /opt/homebrew/include/gemmi/
-with read_file or grep_codebase (the gemmi tree is searched alongside coot).
+when in doubt, read the header directly with read_file or grep_codebase
+(gemmi headers are at /lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include/gemmi/).
 """
 
 GEMMI_SYSTEM_PROMPT = f"""\
@@ -181,8 +201,9 @@ translating its Google Test, in the same session.
    when you need to see a usage pattern.
 7. Link target: test.cc (+ function.cc if present) against -lgemmi_cpp and
    -lgtest. No MMDB, no clipper, no coot libraries.
-8. Call compile_gemmi with your drafts. Fix errors until it builds. Then
-   call run_gemmi_test to confirm assertions pass. Max {MAX_COMPILE_ATTEMPTS} compile attempts.
+8. Call compile_gemmi with your drafts. It compiles and immediately runs the
+   tests. If tests FAIL, fix the assertions and call compile_gemmi again —
+   keep iterating until all tests PASS. Max {MAX_COMPILE_ATTEMPTS} attempts.
 
 Final output format (ONE response, THREE fenced blocks in this exact order):
 
@@ -303,7 +324,15 @@ def _make_tool_handlers(gemmi_subdir: Path) -> tuple[callable, callable, callabl
                       + f"\n... ({len(lines) - 120} more — use get_compile_errors)")
         if success:
             last_binary[0] = test_bin
-            return f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS})."
+            run_ok, run_out = run_gemmi_test_binary(test_bin)
+            run_lines = run_out.splitlines()
+            if len(run_lines) > 100:
+                run_out = "\n".join(run_lines[:100]) + f"\n... ({len(run_lines) - 100} more lines)"
+            status = "All tests PASSED." if run_ok else "Some tests FAILED — fix the assertions and recompile."
+            return (
+                f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}).\n"
+                f"{status}\n{run_out}"
+            )
         last_binary[0] = None
         last_error_log[0] = error_log
         return f"Compilation FAILED (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}):\n{output}"

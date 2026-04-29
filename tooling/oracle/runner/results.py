@@ -46,32 +46,53 @@ _OUTPUT_RE = re.compile(r"^OUTPUT\s+(.+?):\s*(.*)$", re.MULTILINE)
 
 def _parse_cases(stdout: str) -> list[dict]:
     """Group INPUT/OUTPUT lines into discrete test cases.
-    A new case begins when an INPUT line appears after at least one OUTPUT."""
+
+    A new case begins when an INPUT line appears after at least one OUTPUT.
+    Within a case, if the same key appears multiple times (e.g. an oracle that
+    prints all atom inputs then all atom outputs), the inputs and outputs are
+    paired positionally and split into individual cases — one per repeated key.
+    """
     cases: list[dict] = []
-    current: dict | None = None
+    cur_inputs:  list[tuple[str, str]] = []
+    cur_outputs: list[tuple[str, str]] = []
     seen_output = False
+
+    def _flush() -> None:
+        nonlocal cur_inputs, cur_outputs, seen_output
+        if not cur_inputs and not cur_outputs:
+            return
+        in_keys  = [k for k, _ in cur_inputs]
+        out_keys = [k for k, _ in cur_outputs]
+        has_collision = len(in_keys) != len(set(in_keys)) or \
+                        len(out_keys) != len(set(out_keys))
+        if has_collision and len(cur_inputs) == len(cur_outputs):
+            # Pair by position — e.g. N INPUT residue lines then N OUTPUT residue lines
+            for (ik, iv), (ok, ov) in zip(cur_inputs, cur_outputs):
+                cases.append({"inputs": {ik: iv}, "outputs": {ok: ov}})
+        elif has_collision:
+            # Counts differ — index the keys to preserve all values
+            cases.append({
+                "inputs":  {f"{k}[{i}]": v for i, (k, v) in enumerate(cur_inputs)},
+                "outputs": {f"{k}[{i}]": v for i, (k, v) in enumerate(cur_outputs)},
+            })
+        else:
+            cases.append({"inputs": dict(cur_inputs), "outputs": dict(cur_outputs)})
+        cur_inputs.clear()
+        cur_outputs.clear()
+        seen_output = False
 
     for line in stdout.splitlines():
         inp = re.match(r"^INPUT\s+(.+?):\s*(.*)$", line)
         out = re.match(r"^OUTPUT\s+(.+?):\s*(.*)$", line)
-
         if inp:
             if seen_output:
-                cases.append(current)
-                current = {"inputs": {}, "outputs": {}}
-                seen_output = False
-            elif current is None:
-                current = {"inputs": {}, "outputs": {}}
-            current["inputs"][inp.group(1).strip()] = inp.group(2).strip()
+                _flush()
+            cur_inputs.append((inp.group(1).strip(), inp.group(2).strip()))
         elif out:
-            if current is None:
-                current = {"inputs": {}, "outputs": {}}
-            current["outputs"][out.group(1).strip()] = out.group(2).strip()
+            cur_outputs.append((out.group(1).strip(), out.group(2).strip()))
             seen_output = True
 
-    if current and (current["inputs"] or current["outputs"]):
-        cases.append(current)
-
+    _flush()
     return cases
 
 

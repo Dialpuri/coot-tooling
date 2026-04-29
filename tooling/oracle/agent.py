@@ -82,12 +82,13 @@ NUDGE_EVERY_N_TURNS = int(os.environ.get("CT_AGENT_NUDGE_EVERY", 5))
 # spends 12+ turns analysing instead of testing a draft. Set to 0 to disable.
 NO_COMPILE_AFTER = int(os.environ.get("CT_AGENT_NO_COMPILE_AFTER", 6))
 
-NOTES_DIR     = Path(__file__).parent / "notes"
-ANSWER_MARKER = "## Answer"
-TEST_DATA_DIR = Path(__file__).parent.parent.parent / "test-data"
+NOTES_DIR        = Path(__file__).parent / "notes"
+ANSWER_MARKER    = "## Answer"
+TEST_DATA_DIR    = Path(__file__).parent.parent.parent / "test-data"
+THIRD_PARTY_INCLUDE = str(Path(__file__).parent.parent.parent / "third-party" / "google-test" / "include")
 
 # Paths the model is allowed to read.
-ALLOWED_READ_ROOTS = [PROJECT_ROOT] + INCLUDE_ROOTS
+ALLOWED_READ_ROOTS = [PROJECT_ROOT] + INCLUDE_ROOTS + [str(TEST_DATA_DIR), THIRD_PARTY_INCLUDE]
 
 AGENT_SYSTEM_PROMPT = f"""\
 You are writing a complete, compilable C++ program (oracle.cc) that observes
@@ -119,6 +120,16 @@ Don't keep trying to refine if the output is useful.\
 _MAX_COMPILE_ATTEMPTS = 5
 _EXTENSION_TURNS = 20
 _MAX_EXTENSIONS  = 2
+_DEGEN_RECOVERY_TURNS = 4
+
+_DEGEN_RECOVERY_NUDGE = (
+    "Your thinking just entered an infinite loop — analysis paralysis. "
+    "STOP. You have already gathered enough context to write a working oracle. "
+    "Call compile_oracle NOW with your best attempt at the code. "
+    "Research tools are disabled for the next {n} turns; you may only use "
+    "compile_oracle and run_oracle. Write the code and compile it — "
+    "compiler errors are far more useful than further speculation."
+)
 _EXTENSION_PROMPT = (
     "You have used all available turns. "
     "If you still need to compile, run, or fix errors, respond with tool calls "
@@ -740,6 +751,14 @@ def _tool_resolve_includes(code: str) -> str:
             lines.append(f'OK  {shown}  (C/C++ standard library)')
             continue
 
+        # Double-quoted includes with no path separator are local/relative
+        # includes — the compiler resolves them from the source file's own
+        # directory (implicit -I.). We can't check them here without knowing
+        # the compile working directory, so accept them unconditionally.
+        if delim == '"' and "/" not in inc:
+            lines.append(f'OK  {shown}  (local relative include — resolved by compiler cwd)')
+            continue
+
         # Try resolving from each allowed root directly.
         found_at: list[str] = []
         for root in ALLOWED_READ_ROOTS:
@@ -1180,12 +1199,14 @@ def _dispatch(conn: sqlite3.Connection, name: str, args: dict) -> str:
 
 # ── Ollama chat API ───────────────────────────────────────────────────────────
 
+_DEGEN_CHECK_INTERVAL = 2000  # chars of new thinking between degeneracy checks
+
 def _chat(messages: list[dict], model: str, tools: list[dict]) -> dict:
     payload = json.dumps({
         "model":    model,
         "messages": messages,
         "tools":    tools,
-        "stream":   False,
+        "stream":   True,
         "think":    True,
         "options":  OLLAMA_OPTIONS,
     }).encode()
@@ -1194,8 +1215,42 @@ def _chat(messages: list[dict], model: str, tools: list[dict]) -> dict:
         data=payload,
         headers={"Content-Type": "application/json"},
     )
+    accumulated_thinking = ""
+    accumulated_content  = ""
+    accumulated_tool_calls: list = []
+    last_check_len        = 0
     with urllib.request.urlopen(req, timeout=600) as resp:
-        return json.loads(resp.read())
+        for raw_line in resp:
+            line = raw_line.strip()
+            if not line:
+                continue
+            chunk = json.loads(line)
+            msg_chunk = chunk.get("message", {})
+            accumulated_thinking += msg_chunk.get("thinking", "") or ""
+            accumulated_content  += msg_chunk.get("content",  "") or ""
+            # Tool calls arrive in a single intermediate chunk, not in the
+            # done:true stats chunk — accumulate from every chunk.
+            if msg_chunk.get("tool_calls"):
+                accumulated_tool_calls = msg_chunk["tool_calls"]
+            if chunk.get("done"):
+                break
+            # Abort early if thinking enters a degenerate loop, saving the
+            # rest of num_ctx from being consumed by garbage. The caller's
+            # post-hoc _is_degenerate_thinking check will still fire on the
+            # partial thinking and trigger the rescue path.
+            new_len = len(accumulated_thinking)
+            if new_len - last_check_len >= _DEGEN_CHECK_INTERVAL:
+                last_check_len = new_len
+                if _is_degenerate_thinking(accumulated_thinking)[0]:
+                    break
+    return {
+        "message": {
+            "role":       "assistant",
+            "thinking":   accumulated_thinking,
+            "content":    accumulated_content,
+            "tool_calls": accumulated_tool_calls,
+        }
+    }
 
 
 # ── agent loop ────────────────────────────────────────────────────────────────
@@ -1317,6 +1372,7 @@ def generate_with_agent(
     tool_cache: dict[str, str] = {}          # memoize read-only lookups within a session
     REPEAT_LIMIT = 3
     no_compile_warned = [False]              # one-shot guard for the no-compile nudge
+    degen_recoveries = [0]                   # how many times we've nudged out of a degen loop
     # Tools whose output may differ across calls or which have side effects —
     # never serve from cache.
     NO_CACHE = {"compile_oracle", "run_oracle", "leave_note"}
@@ -1406,12 +1462,28 @@ def generate_with_agent(
             trace_lines.append(f"[thinking — turn {turn + 1}]\n{textwrap.indent(thinking, '  ')}\n")
 
         # Degenerate-thinking guard: pathologically repetitive thinking
-        # means the model has burned its output window on garbage and the
-        # rest of this response is unrecoverable.
+        # means the model burned its output window on garbage without emitting
+        # a tool call or final answer. Inject a targeted nudge and continue
+        # the loop so the model can recover naturally with all tools intact.
+        # After two failed recoveries, give up and let rescue handle it.
         degen, diag = _is_degenerate_thinking(thinking)
         if degen:
-            trace_lines.append(f"[agent] {diag} — aborting loop, will issue rescue.\n")
-            break
+            degen_recoveries[0] += 1
+            if degen_recoveries[0] > 2:
+                trace_lines.append(f"[agent] {diag} — recovery exhausted, going to rescue.\n")
+                break
+            trace_lines.append(
+                f"[agent] {diag} — injecting recovery nudge "
+                f"(attempt {degen_recoveries[0]}).\n"
+            )
+            if messages and messages[-1].get("role") == "assistant":
+                messages[-1] = {"role": "assistant",
+                                "content": "[thinking loop truncated]",
+                                "tool_calls": []}
+            recovery_msg = _DEGEN_RECOVERY_NUDGE.format(n=_DEGEN_RECOVERY_TURNS)
+            messages.append({"role": "user", "content": recovery_msg})
+            trace_lines.append(f"[recovery nudge]\n{textwrap.indent(recovery_msg, '  ')}\n")
+            continue
 
         if not tool_calls:
             trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")

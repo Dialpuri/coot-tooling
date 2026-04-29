@@ -8,21 +8,21 @@ from ..db import PROJECT_ROOT
 
 # ── constants (mirrored from mmdb-refactor-ui/backend/config.py) ─────────────
 CXX           = "c++"
-COOT_API_DIR  = "/Users/dialpuri/lmb/build-coot-and-deps"
-COOT_API_NAME = "cootapi"
-MMDB_API_DIR  = "/opt/homebrew/Cellar/mmdb2/2.0.22/lib"
+COOT_API_DIR  = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/lib"
+COOT_API_NAME = "coot-api"
+MMDB_API_DIR  = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/lib"
 MMDB_API_NAME = "mmdb2"
-CLIPPER_API_DIR  = "/opt/homebrew/Cellar/clipper4coot/2.1.20180802_3/lib"
-GEMMI_INCLUDE = "/opt/homebrew/opt/gemmi/include"
-CLIPPER_INCLUDE = "/opt/homebrew/Cellar/clipper4coot/2.1.20180802_3/include"
-BOOST_INCLUDE = "/opt/homebrew/Cellar/boost/1.90.0_1/include"
-MMDB_INCLUDE  = "/opt/homebrew/Cellar/mmdb2/2.0.22/include"
-GSL_INCLUDE   = "/opt/homebrew/Cellar/gsl/2.8/include"
-PNG_INCLUDE = "/opt/homebrew/Cellar/libpng/1.6.56/include"
-GLM_INCLUDE = "/opt/homebrew/Cellar/glm/1.0.1/include"
+CLIPPER_API_DIR  = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/lib"
+GEMMI_INCLUDE = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
+CLIPPER_INCLUDE = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
+BOOST_INCLUDE = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
+MMDB_INCLUDE  = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
+GSL_INCLUDE   = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
+PNG_INCLUDE = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
+GLM_INCLUDE = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
 
 def make_compile_cmd(oracle_cc: Path, output_bin: Path) -> str:
-    includes = [PROJECT_ROOT, GEMMI_INCLUDE, CLIPPER_INCLUDE, BOOST_INCLUDE, MMDB_INCLUDE, GSL_INCLUDE, PNG_INCLUDE, GLM_INCLUDE]
+    includes = [PROJECT_ROOT, GEMMI_INCLUDE]
     includes = " ".join(f'-I"{i}"' for i in includes)
 
     clipper_libraries = [
@@ -33,12 +33,12 @@ def make_compile_cmd(oracle_cc: Path, output_bin: Path) -> str:
 
     return (
         f'{CXX} -std=c++17 "{oracle_cc}" -o "{output_bin}" '
-        f'{includes} '
+        f'{includes}  '
         f'-pthread '
         f'-Wl,-rpath,{COOT_API_DIR} '
         f'-L "{COOT_API_DIR}" -l{COOT_API_NAME} '
-        f'-L "{MMDB_API_DIR}" -l{MMDB_API_NAME} '
-        f'-L "{CLIPPER_API_DIR}" {clipper_libraries}'
+        f'-l{MMDB_API_NAME} '
+        f'{clipper_libraries}'
 
     )
 
