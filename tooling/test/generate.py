@@ -10,8 +10,9 @@ from pathlib import Path
 
 from ..oracle.runner.results import OracleResult, load_result, parse_output
 from .compile import compile_test_cc, run_test_binary, write_compile_script
+from ..ollama import chat_url
 
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"  # kept for reference
 DEFAULT_MODEL   = "qwen3.6"
 
 _SYSTEM_PROMPT = """\
@@ -35,7 +36,7 @@ Rules:
 
 def _ollama_chat(messages: list[dict], model: str) -> str:
     payload = json.dumps({"model": model, "messages": messages, "stream": False}).encode()
-    req = urllib.request.Request(OLLAMA_CHAT_URL, data=payload,
+    req = urllib.request.Request(chat_url(), data=payload,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.loads(resp.read())

@@ -25,8 +25,9 @@ from .render import build_oracle_prompt
 from .agent import generate_with_agent
 from .compile import write_compile_script, compile_oracle
 from .notes import extract_oracle_notes, save_notes
+from ..ollama import generate_url
 
-OLLAMA_URL    = "http://localhost:11434/api/generate"
+OLLAMA_URL    = "http://localhost:11434/api/generate"  # kept for reference
 DEFAULT_MODEL = "qwen3.6"
 OUT_ROOT      = Path(__file__).parent.parent.parent / "generated-tests"
 
@@ -63,7 +64,7 @@ def call_ollama(prompt: str, model: str) -> str:
     }).encode()
 
     req = urllib.request.Request(
-        OLLAMA_URL,
+        generate_url(),
         data=payload,
         headers={"Content-Type": "application/json"},
     )

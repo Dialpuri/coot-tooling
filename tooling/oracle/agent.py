@@ -33,8 +33,9 @@ from ..db import (
     get_containing_class,
 )
 from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNIPPET, caller_class_fields
+from ..ollama import chat_url
 
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"  # kept for backward-compat imports
 
 # Ollama runtime options. These override the model's Modelfile defaults for
 # this request only. The defaults below assume a long-running tool-calling
@@ -80,7 +81,7 @@ NUDGE_EVERY_N_TURNS = int(os.environ.get("CT_AGENT_NUDGE_EVERY", 5))
 # without a single attempt at the compile tool, fire a one-shot warning that
 # names the tool explicitly. Targets the failure mode where the model
 # spends 12+ turns analysing instead of testing a draft. Set to 0 to disable.
-NO_COMPILE_AFTER = int(os.environ.get("CT_AGENT_NO_COMPILE_AFTER", 6))
+NO_COMPILE_AFTER = int(os.environ.get("CT_AGENT_NO_COMPILE_AFTER", 5))
 
 NOTES_DIR        = Path(__file__).parent / "notes"
 ANSWER_MARKER    = "## Answer"
@@ -495,26 +496,32 @@ def _is_degenerate_thinking(
     min_line_len: int = 25,
     min_count: int = 8,
     min_ratio: float = 0.10,
+    # Block-level repetition: a run of N consecutive substantive lines
+    # that appears more than max_block_repeats times signals a loop even
+    # when no single line individually crosses the per-line threshold.
+    block_ngram_size: int = 5,
+    max_block_repeats: int = 3,
 ) -> tuple[bool, str]:
     """Detect pathological repetition in a thinking block.
 
-    Pathological = a substantive line (≥`min_line_len` chars after strip)
-    appears at least `min_count` times AND ≥`min_ratio` of all substantive
-    lines. The length filter excludes legitimate short repeats like "}" or
-    "Yes.". Calibrated against the real failure case in
-    add_neighbor_residues_for_refinement_help where each of the top four
-    lines repeated ~77× at ~16% — well above this threshold.
-
-    Catches the failure mode where low-temp + low-repeat-penalty + thinking
-    mode causes the model to reproduce one paragraph dozens of times until
-    num_ctx is saturated. When that happens the agent never emits a usable
-    tool call or final block, so we short-circuit straight to rescue.
+    Two checks:
+    1. Single-line: a substantive line (≥min_line_len chars) appears
+       ≥min_count times AND ≥min_ratio of all substantive lines.
+    2. Block-level: a tuple of block_ngram_size consecutive substantive
+       lines appears more than max_block_repeats times, catching the case
+       where the model re-writes entire paragraphs rather than single lines.
     """
     from collections import Counter
-    lines = [l.strip() for l in thinking.splitlines()
+    # Strip fenced code blocks before analysis — repeated constant initialisers,
+    # parallel EXPECT_EQ lines, and array literals inside ```...``` are legitimate
+    # code, not degeneracy.
+    prose = re.sub(r"```.*?```", "", thinking, flags=re.DOTALL)
+    lines = [l.strip() for l in prose.splitlines()
              if len(l.strip()) >= min_line_len]
     if len(lines) < min_lines:
         return False, ""
+
+    # Check 1: single-line frequency
     counter = Counter(lines)
     top_line, top_count = counter.most_common(1)[0]
     ratio = top_count / len(lines)
@@ -525,7 +532,42 @@ def _is_degenerate_thinking(
             f"{top_count}× ({ratio:.0%} of {len(lines)} substantive lines). "
             f"Sample: {snippet!r}"
         )
+
+    # Check 2: block-level N-gram repetition
+    if len(lines) >= block_ngram_size:
+        ngrams = Counter(
+            tuple(lines[i:i + block_ngram_size])
+            for i in range(len(lines) - block_ngram_size + 1)
+        )
+        top_ngram, top_ng_count = ngrams.most_common(1)[0]
+        if top_ng_count > max_block_repeats:
+            snippet = " | ".join(s[:40] for s in top_ngram[:2])
+            return True, (
+                f"Degenerate thinking detected: {block_ngram_size}-line block "
+                f"repeated {top_ng_count}× (threshold {max_block_repeats}). "
+                f"Sample: {snippet!r}…"
+            )
+
     return False, ""
+
+
+def _has_compile_intent(thinking: str) -> bool:
+    """Return True if thinking expresses an intent to compile but no tool call followed.
+
+    Matches phrases like "let me compile", "I'll call compile_gemmi", "time to
+    compile", "draft and compile" — the signal that the model decided to compile
+    then talked itself out of it before making the actual tool call.
+    """
+    return bool(re.search(
+        r"let me (?:just |now )?(?:compile|draft|call compile)"
+        r"|i(?:'ll| will) (?:compile|call compile|draft)"
+        r"|(?:time|ready) to compile"
+        r"|call compile_gemmi now"
+        r"|draft.*and.*compile"
+        r"|compile.*now",
+        thinking,
+        re.IGNORECASE,
+    ))
 
 
 # ── tool implementations ──────────────────────────────────────────────────────
@@ -559,6 +601,53 @@ def _tool_lookup_function(conn: sqlite3.Connection, qualified_name: str) -> str:
     return "\n".join(parts)
 
 
+# Hint banner appended to lookup_type output for the gemmi types that the
+# agent confuses most often. Targets the recurring "non-pointer type" and
+# "no member named X" errors visible in generated-tests/*/gemmi/compile.log.
+_GEMMI_TYPE_HINTS: dict[str, str] = {
+    "gemmi::Structure": (
+        "VALUE TYPE — st is `gemmi::Structure`, NOT `gemmi::Structure*`.\n"
+        "  Children are values too: st.models[0] is a Model (not Model*).\n"
+        "  Common fields: name, cell, spacegroup_hm, models (vector<Model>),\n"
+        "  connections (NOT links), assemblies, raw_remarks, helices, sheets,\n"
+        "  cispeps. NO `space_group` field — use `spacegroup_hm`."
+    ),
+    "gemmi::Model": (
+        "VALUE TYPE — model is `Model`, NOT `Model*`. Stored in st.models.\n"
+        "  Children: chains (vector<Chain>). NO Model::n_atoms() — use model.all().\n"
+        "  Sheets/helices/cispeps/connections live on Structure, NOT Model."
+    ),
+    "gemmi::Chain": (
+        "VALUE TYPE — chain is `Chain`, NOT `Chain*`. Stored in model.chains.\n"
+        "  Fields: name (NOT GetChainID()), residues (vector<Residue>).\n"
+        "  Residue lookup: chain.find_residue(ResidueId), find_or_add_residue."
+    ),
+    "gemmi::Residue": (
+        "VALUE TYPE — residue is `Residue`, NOT `Residue*` (unless from\n"
+        "  find_residue → returns nullable pointer). Stored in chain.residues.\n"
+        "  NO parent pointer: residue.chain DOES NOT EXIST. Track Chain*\n"
+        "  alongside, or iterate chains→residues. Inherits ResidueId:\n"
+        "  residue.name, residue.seqid.num.value, residue.seqid.icode,\n"
+        "  residue.subchain, residue.entity_id, residue.atoms, residue.het_flag.\n"
+        "  NO Residue::add_atom() — use residue.atoms.push_back(atom)."
+    ),
+    "gemmi::Atom": (
+        "VALUE TYPE — atom is `Atom`, NOT `Atom*`. Stored in residue.atoms.\n"
+        "  Fields: name (std::string), element (gemmi::Element), pos (Position\n"
+        "  with .x/.y/.z), occ, b_iso, altloc (NOT alt_loc — no underscore),\n"
+        "  charge (signed char), serial, flag.\n"
+        "  Construct element via gemmi::Element(\"C\"), NOT gemmi::Element::C."
+    ),
+    "gemmi::Fractional": (
+        "Inherits from Vec3 — uses .x/.y/.z. NO .u/.v/.w members."
+    ),
+    "gemmi::ResidueId": (
+        "Sequence number lives at .seqid.num.value (SeqId nests OptionalInt).\n"
+        "  Insertion code at .seqid.icode (char). NO .num or .icode directly."
+    ),
+}
+
+
 def _tool_lookup_type(conn: sqlite3.Connection, name: str) -> str:
     # Disambiguate bare names: 'Residue' exists in mmdb, gemmi, coot and more;
     # silently picking one arbitrary hit is how the agent ends up inventing
@@ -578,6 +667,13 @@ def _tool_lookup_type(conn: sqlite3.Connection, name: str) -> str:
         return f"Type '{name}' not found in DB."
     methods = get_type_methods(conn, row["qualified_name"])
     lines = [f"// {row['kind']} {row['qualified_name']}  ({row['file']})"]
+    # Prepend the hint where applicable — placed above the summary so it is
+    # visible even when the model only reads the first chunk of the response.
+    hint = _GEMMI_TYPE_HINTS.get(row["qualified_name"])
+    if hint:
+        lines.append("// HINT — common pitfalls:")
+        for hint_line in hint.splitlines():
+            lines.append(f"//   {hint_line}")
     lines.append(row["summary"] or "(no summary)")
     if methods:
         lines.append("\n// Methods:")
@@ -1211,7 +1307,7 @@ def _chat(messages: list[dict], model: str, tools: list[dict]) -> dict:
         "options":  OLLAMA_OPTIONS,
     }).encode()
     req = urllib.request.Request(
-        OLLAMA_CHAT_URL,
+        chat_url(),
         data=payload,
         headers={"Content-Type": "application/json"},
     )

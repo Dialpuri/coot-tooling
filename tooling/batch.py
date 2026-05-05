@@ -28,6 +28,7 @@ Usage (file mode):
 from __future__ import annotations
 
 import argparse
+import itertools
 import sys
 import traceback
 import urllib.error
@@ -40,6 +41,9 @@ from .oracle.generate import DEFAULT_MODEL, OUT_ROOT, generate_one, sanitize_nam
 from .test.generate import generate_test
 from .gemmi.generate import generate_gemmi
 from .gemmi.aggregate import aggregate_gemmi_files
+from .ollama import OLLAMA_HOSTS, set_host, get_host
+
+_task_seq = itertools.count()  # global task counter for host round-robin
 
 
 # ── result tracking ───────────────────────────────────────────────────────────
@@ -80,12 +84,44 @@ def topo_order(deps: dict[str, set[str]]) -> list[str]:
     return order
 
 
+def topo_waves(deps: dict[str, set[str]]) -> list[list[str]]:
+    """Return qnames grouped by topological level.
+
+    Each wave contains qnames that depend ONLY on names in earlier waves —
+    so they can be processed concurrently. Use this with ThreadPoolExecutor
+    to keep the callees-first guarantee while still parallelising across
+    workers. Cycle-breaking matches `topo_order`: when no deps are clear,
+    promote the node with the fewest outstanding deps (deterministic).
+    """
+    remaining = {q: set(d) for q, d in deps.items()}
+    waves: list[list[str]] = []
+    while remaining:
+        ready = sorted(q for q, d in remaining.items() if not d)
+        if not ready:
+            # Cycle: break it by promoting the node closest to ready, which
+            # avoids stalling on a strongly-connected component.
+            pick = min(remaining, key=lambda q: (len(remaining[q]), q))
+            ready = [pick]
+        waves.append(ready)
+        for q in ready:
+            del remaining[q]
+        for d in remaining.values():
+            d.difference_update(ready)
+    return waves
+
+
 # ── per-function worker ───────────────────────────────────────────────────────
 
 def _is_complete(out_dir: Path) -> bool:
     """Return True if the function already has gemmi/function.hh and gemmi/test.cc."""
     return (out_dir / "gemmi" / "function.hh").exists() and \
            (out_dir / "gemmi" / "test.cc").exists()
+
+
+def _test_is_passing(out_dir: Path) -> bool:
+    """Return True if test/run.log exists and records an all-passed result."""
+    log = out_dir / "test" / "run.log"
+    return log.exists() and "[  PASSED  ]" in log.read_text()
 
 
 def _process(
@@ -105,14 +141,20 @@ def _process(
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "batch.log"
 
+    host = get_host()
+    host_idx = OLLAMA_HOSTS.index(host) if host in OLLAMA_HOSTS else -1
+    _COLORS = ["\033[36m", "\033[32m", "\033[33m", "\033[35m"]  # cyan, green, yellow, magenta
+    _RESET  = "\033[0m"
+    _color  = _COLORS[host_idx % len(_COLORS)] if host_idx >= 0 else ""
+
     def log(msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
-        print(line, flush=True)
+        print(f"{_color}{line}{_RESET}", flush=True)
         with log_path.open("a") as f:
             f.write(line + "\n")
 
-    log(f"START {qname}")
+    log(f"START {qname} [ollama #{host_idx} — {host}]")
 
     # ── completion check ──────────────────────────────────────────────────────
     if not overwrite and _is_complete(out_dir):
@@ -159,16 +201,20 @@ def _process(
         r.oracle_ok = True
 
     # ── test phase ────────────────────────────────────────────────────────────
-    log("test: generating ...")
-    try:
-        generate_test(out_dir, model=model, agent=agent, verbose=verbose)
-        log("test: ok")
+    if not overwrite and _test_is_passing(out_dir):
+        log("test: skipped (already passing)")
         r.test_ok = True
-    except Exception as e:
-        log(f"test: FAILED — {e}\n{traceback.format_exc()}")
-        r.test_ok = False
-        r.error = f"test generation failed: {e}"
-        return r
+    else:
+        log("test: generating ...")
+        try:
+            generate_test(out_dir, model=model, agent=agent, verbose=verbose)
+            log("test: ok")
+            r.test_ok = True
+        except Exception as e:
+            log(f"test: FAILED — {e}\n{traceback.format_exc()}")
+            r.test_ok = False
+            r.error = f"test generation failed: {e}"
+            return r
 
     # ── gemmi port phase (optional) ───────────────────────────────────────────
     if with_gemmi:
@@ -184,6 +230,104 @@ def _process(
 
     log(f"DONE oracle={r.oracle_ok} test={r.test_ok} gemmi={r.gemmi_ok}")
     return r
+
+
+# ── parallel scheduling ───────────────────────────────────────────────────────
+
+def _run_in_parallel(qnames: list[str], args, *, label: str = "") -> list[Result]:
+    """Submit every qname to a thread pool and collect Results.
+
+    Use for one wave of a topo schedule, or for the whole batch when
+    --no-topo is set. Results return in completion order, not submission
+    order.
+    """
+    # Some entry points use --with-gemmi (default off), others use --no-gemmi
+    # (default on). Resolve to a single bool here so the worker call is uniform.
+    with_gemmi = (
+        getattr(args, "with_gemmi", False)
+        if hasattr(args, "with_gemmi")
+        else not getattr(args, "no_gemmi", False)
+    )
+
+    hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
+
+    def _process_with_host(qname: str, host: str) -> Result:
+        set_host(host)
+        return _process(qname, args.model, args.agent, args.verbose,
+                        args.skip_oracle, args.skip_existing,
+                        with_gemmi, args.overwrite)
+
+    out: list[Result] = []
+    futures = {}
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for qname in qnames:
+            host = hosts[next(_task_seq) % len(hosts)]
+            f = pool.submit(_process_with_host, qname, host)
+            futures[f] = qname
+        for f in as_completed(futures):
+            r = f.result()
+            out.append(r)
+            status = "skipped" if r.skipped else ("ok" if not r.error else "FAILED")
+            prefix = f"  [{label}] " if label else "  "
+            print(f"{prefix}{r.short}: {status}")
+    return out
+
+
+def _run_topo_waves(qnames: list[str], args) -> list[Result]:
+    """Process qnames respecting call-graph deps with a single shared pool.
+
+    A task is submitted as soon as all its in-batch deps have completed,
+    rather than waiting for an entire wave barrier. This keeps both workers
+    busy even when the dep graph is a long chain of size-1 waves.
+    """
+    conn = connect()
+    try:
+        deps = get_internal_call_deps(conn, qnames)
+    finally:
+        conn.close()
+
+    with_gemmi = (
+        getattr(args, "with_gemmi", False)
+        if hasattr(args, "with_gemmi")
+        else not getattr(args, "no_gemmi", False)
+    )
+    hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
+
+    def _process_with_host(qname: str, host: str) -> Result:
+        set_host(host)
+        return _process(qname, args.model, args.agent, args.verbose,
+                        args.skip_oracle, args.skip_existing,
+                        with_gemmi, args.overwrite)
+
+    # pending[q] = set of in-batch deps not yet completed
+    pending: dict[str, set[str]] = {q: set(deps.get(q, set())) for q in qnames}
+    in_flight: dict[object, str] = {}  # future -> qname
+    results: list[Result] = []
+
+    def _submit_ready(pool) -> None:
+        for q in list(pending):
+            if not pending[q]:
+                host = hosts[next(_task_seq) % len(hosts)]
+                f = pool.submit(_process_with_host, q, host)
+                in_flight[f] = q
+                del pending[q]
+
+    print(f"Dep-parallel schedule: {len(qnames)} qname(s), {len(deps)} with in-batch deps")
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        _submit_ready(pool)
+        while in_flight:
+            done = next(as_completed(in_flight))
+            qname = in_flight.pop(done)
+            r = done.result()
+            results.append(r)
+            status = "skipped" if r.skipped else ("ok" if not r.error else "FAILED")
+            print(f"  {r.short}: {status}", flush=True)
+            # unlock any tasks that were waiting on this one
+            for p in pending.values():
+                p.discard(qname)
+            _submit_ready(pool)
+
+    return results
 
 
 # ── summary ───────────────────────────────────────────────────────────────────
@@ -264,20 +408,16 @@ def main() -> None:
             print(f"No methods match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
 
-    # Bottom-up topological ordering: callees before callers. Skipped in
-    # parallel mode because dependencies can't be enforced once workers run
-    # concurrently — use --workers 1 to keep the guarantee.
-    if not args.no_topo:
-        if args.workers > 1:
-            print("[warn] --workers > 1 disables call-graph ordering; "
-                  "pass --no-topo to silence this.", file=sys.stderr)
-        else:
-            conn = connect()
-            try:
-                deps = get_internal_call_deps(conn, qnames)
-            finally:
-                conn.close()
-            qnames = topo_order(deps)
+    # Bottom-up topological ordering: callees before callers.
+    # Single-worker mode → flat order. Multi-worker mode → waves so parallelism
+    # is preserved without violating the callees-first invariant.
+    if not args.no_topo and args.workers == 1:
+        conn = connect()
+        try:
+            deps = get_internal_call_deps(conn, qnames)
+        finally:
+            conn.close()
+        qnames = topo_order(deps)
 
     if args.list:
         for q in qnames:
@@ -288,28 +428,20 @@ def main() -> None:
     print(f"Processing {len(qnames)} methods from {args.class_name} "
           f"(model={args.model}, workers={args.workers}, agent={args.agent})")
 
-    results: list[Result] = []
-
+    hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
     if args.workers == 1:
+        results: list[Result] = []
+        set_host(hosts[0])
         for i, qname in enumerate(qnames, 1):
             print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]}", flush=True)
             r = _process(qname, args.model, args.agent, args.verbose,
                          args.skip_oracle, args.skip_existing,
                          with_gemmi=args.with_gemmi, overwrite=args.overwrite)
             results.append(r)
+    elif args.no_topo:
+        results = _run_in_parallel(qnames, args)
     else:
-        futures = {}
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            for qname in qnames:
-                f = pool.submit(_process, qname, args.model, args.agent,
-                                args.verbose, args.skip_oracle, args.skip_existing,
-                                args.with_gemmi, args.overwrite)
-                futures[f] = qname
-            for f in as_completed(futures):
-                r = f.result()
-                results.append(r)
-                status = "skipped" if r.skipped else ("ok" if not r.error else "FAILED")
-                print(f"  {r.short}: {status}")
+        results = _run_topo_waves(qnames, args)
 
     _print_summary(results)
     if any(not r.skipped and (not r.oracle_ok or not r.test_ok) for r in results):
@@ -363,17 +495,16 @@ def main_file() -> None:
             print(f"No functions match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
 
-    if not args.no_topo:
-        if args.workers > 1:
-            print("[warn] --workers > 1 disables call-graph ordering; "
-                  "pass --no-topo to silence this.", file=sys.stderr)
-        else:
-            conn = connect()
-            try:
-                deps = get_internal_call_deps(conn, qnames)
-            finally:
-                conn.close()
-            qnames = topo_order(deps)
+    # Bottom-up topological ordering: callees before callers.
+    # Single-worker mode → flat order. Multi-worker mode → waves so parallelism
+    # is preserved without violating the callees-first invariant.
+    if not args.no_topo and args.workers == 1:
+        conn = connect()
+        try:
+            deps = get_internal_call_deps(conn, qnames)
+        finally:
+            conn.close()
+        qnames = topo_order(deps)
 
     if args.list:
         for q in qnames:
@@ -385,28 +516,20 @@ def main_file() -> None:
     print(f"Processing {len(qnames)} functions from {args.file} "
           f"(model={args.model}, workers={args.workers}, agent={args.agent}, gemmi={with_gemmi})")
 
-    results: list[Result] = []
-
+    hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
     if args.workers == 1:
+        results: list[Result] = []
+        set_host(hosts[0])
         for i, qname in enumerate(qnames, 1):
             print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]}", flush=True)
             r = _process(qname, args.model, args.agent, args.verbose,
                          args.skip_oracle, args.skip_existing,
                          with_gemmi=with_gemmi, overwrite=args.overwrite)
             results.append(r)
+    elif args.no_topo:
+        results = _run_in_parallel(qnames, args)
     else:
-        futures = {}
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            for qname in qnames:
-                f = pool.submit(_process, qname, args.model, args.agent,
-                                args.verbose, args.skip_oracle, args.skip_existing,
-                                with_gemmi, args.overwrite)
-                futures[f] = qname
-            for f in as_completed(futures):
-                r = f.result()
-                results.append(r)
-                status = "skipped" if r.skipped else ("ok" if not r.error else "FAILED")
-                print(f"  {r.short}: {status}")
+        results = _run_topo_waves(qnames, args)
 
     _print_summary(results)
     _aggregate(qnames, args.file, with_gemmi)

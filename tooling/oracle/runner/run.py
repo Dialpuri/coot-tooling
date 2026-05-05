@@ -7,12 +7,13 @@ from pathlib import Path
 from .results import OracleResult, parse_output, save_result
 
 
-def run_binary(binary: Path, args: list[str] | None = None) -> tuple[int, str, str]:
+def run_binary(binary: Path, args: list[str] | None = None, cwd: Path | None = None) -> tuple[int, str, str]:
     """Run a binary, return (returncode, stdout, stderr)."""
     result = subprocess.run(
-        [str(binary)] + (args or []),
+        [str(binary.absolute())] + (args or []),
         capture_output=True,
         text=True,
+        cwd=str(cwd) if cwd else str(binary.parent),
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -30,7 +31,7 @@ def run_oracle(oracle_dir: Path) -> OracleResult:
             outputs={},
         )
 
-    returncode, stdout, stderr = run_binary(binary)
+    returncode, stdout, stderr = run_binary(binary, cwd=oracle_dir)
     result = parse_output(
         returncode=returncode,
         stdout=stdout,

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 from pathlib import Path
 
 from ..db import connect, get_function
 from .compile import compile_gemmi, run_gemmi_test_binary, write_compile_script
+from .agent import _dep_extra_includes, _dep_extra_sources
 
-DEFAULT_MODEL = "qwen3:30b"
+DEFAULT_MODEL = "qwen3.6"
 
 
 def _write_files(oracle_dir: Path, blocks: dict[str, str]) -> Path:
@@ -18,7 +20,6 @@ def _write_files(oracle_dir: Path, blocks: dict[str, str]) -> Path:
     has_cc = "function.cc" in blocks and blocks["function.cc"].strip()
     if has_cc:
         (gemmi_subdir / "function.cc").write_text(blocks["function.cc"])
-    write_compile_script(gemmi_subdir, has_function_cc=bool(has_cc))
     return gemmi_subdir / "test.cc"
 
 
@@ -51,6 +52,11 @@ def generate_gemmi(
             raise RuntimeError(
                 f"No source found in code_graph.db for {function_qname}"
             )
+        # Compute dep build info once — reused by agent compile tool + verify.
+        dep_includes = _dep_extra_includes(_conn, function_qname)
+        dep_sources  = _dep_extra_sources(_conn, function_qname)
+        gemmi_subdir.mkdir(parents=True, exist_ok=True)
+        (gemmi_subdir / "original.cc").write_text(row["source_code"])
         blocks, trace = generate_gemmi_port_with_agent(
             _conn,
             original_function_src=row["source_code"],
@@ -75,7 +81,6 @@ def generate_gemmi(
     # Verify before committing files to disk — if compile or run fails the
     # gemmi/ dir won't contain function.hh + test.cc, so _is_complete stays
     # False and the next batch run will retry rather than skip.
-    import tempfile, shutil
     gemmi_subdir = oracle_dir / "gemmi"
     gemmi_subdir.mkdir(parents=True, exist_ok=True)
 
@@ -92,7 +97,10 @@ def generate_gemmi(
         if has_cc:
             tmp_cc.write_text(blocks["function.cc"])
 
-        ok, output = compile_gemmi(tmp_test, tmp_bin, tmp_cc if has_cc else None)
+        ok, output = compile_gemmi(
+            tmp_test, tmp_bin, tmp_cc if has_cc else None,
+            dep_includes, dep_sources,
+        )
         (gemmi_subdir / "compile.log").write_text(output)
         if not ok:
             raise RuntimeError(f"gemmi test compile failed:\n{output[:500]}")
@@ -102,6 +110,12 @@ def generate_gemmi(
         if not ok:
             raise RuntimeError(f"gemmi test failed:\n{output[:500]}")
 
-    # Tests passed — write final files and compile script.
+    # Tests passed — write final files and compile script (with dep flags).
     test_cc = _write_files(oracle_dir, blocks)
+    write_compile_script(
+        oracle_dir / "gemmi",
+        has_function_cc=has_cc,
+        extra_includes=dep_includes,
+        extra_sources=dep_sources,
+    )
     return test_cc
