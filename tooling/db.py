@@ -18,7 +18,7 @@ def connect() -> sqlite3.Connection:
 def get_function(conn: sqlite3.Connection, qname: str) -> sqlite3.Row | None:
     return conn.execute("""
         SELECT f.id, f.qualified_name, f.display_name, f.source_code, f.comment,
-               fi.path AS file
+               f.access, fi.path AS file
         FROM functions f JOIN files fi ON fi.id = f.file_id
         WHERE f.qualified_name = ?
         ORDER BY f.is_definition DESC

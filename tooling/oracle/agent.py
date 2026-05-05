@@ -81,7 +81,7 @@ NUDGE_EVERY_N_TURNS = int(os.environ.get("CT_AGENT_NUDGE_EVERY", 5))
 # without a single attempt at the compile tool, fire a one-shot warning that
 # names the tool explicitly. Targets the failure mode where the model
 # spends 12+ turns analysing instead of testing a draft. Set to 0 to disable.
-NO_COMPILE_AFTER = int(os.environ.get("CT_AGENT_NO_COMPILE_AFTER", 5))
+NO_COMPILE_AFTER = int(os.environ.get("CT_AGENT_NO_COMPILE_AFTER", 10))
 
 NOTES_DIR        = Path(__file__).parent / "notes"
 ANSWER_MARKER    = "## Answer"
@@ -107,6 +107,45 @@ Requirements for oracle.cc:
        OUTPUT <name>: <value>
   6. Use this pattern to produce a few edge cases too.
 
+Proving the function actually ran (critical):
+  Before implementing, read the function source carefully and identify exactly
+  what it modifies or returns. Then:
+  - For functions that return a value: print the return value as OUTPUT.
+  - For void functions that modify a container/vector/map: print its size()
+    or a key element BEFORE and AFTER the call. A before==after result means
+    the function did nothing — your inputs did not satisfy its preconditions.
+  - If the function has guard clauses (if(!x) return; early exits): read them,
+    then set up inputs that pass those guards and reach the core logic.
+  - run_oracle will warn you if no OUTPUT lines are produced — treat that as a
+    test failure and fix the inputs or the print statements.
+
+Accessing private members (oracle.cc is a test binary — this is always allowed):
+  If the target function is private, or if setting up the receiver requires
+  touching private member variables, use the `#define private public` trick.
+
+  CRITICAL: the macro corrupts any header whose implementation uses `private`
+  internally (the entire C++ standard library does). The only reliable way to
+  prevent this is to fire ALL standard-library include guards BEFORE the macro
+  is activated. Use `#include <bits/stdc++.h>` (GCC extension, always
+  available on this platform) as the very first line of oracle.cc:
+
+    // oracle.cc — ALWAYS start with this line when using the trick
+    #include <bits/stdc++.h>   // fires all std include guards; safe from now on
+
+    // Then mmdb, clipper, and any other third-party headers
+    #include <mmdb2/mmdb_manager.h>
+    // ...
+
+    // Finally, wrap ONLY the specific Coot class header that declares the target
+    #define private public
+    #define protected public
+    #include "path/to/TargetClass.hh"
+    #undef protected
+    #undef private
+
+  With this ordering the macro is only active while the target class header is
+  parsed; every other header's include guard has already fired and is a no-op.
+
 Mandatory steps before outputting the final program:
   a. Call resolve_includes on your draft to verify all #include "..." headers.
   b. Call compile_oracle with your draft — fix all errors and retry until it succeeds.
@@ -114,11 +153,11 @@ Mandatory steps before outputting the final program:
   d. Fix any runtime errors or missing output, recompile, and re-run.
   e. Only then output the final program in a ```cpp block.
 
-Use C++ code where possible, avoid C style code. Compile your draft as soon as reasonable. 
+Use C++ code where possible, avoid C style code. Compile your draft as soon as reasonable.
 Don't keep trying to refine if the output is useful.\
 """
 
-_MAX_COMPILE_ATTEMPTS = 5
+_MAX_COMPILE_ATTEMPTS = 20
 _EXTENSION_TURNS = 20
 _MAX_EXTENSIONS  = 2
 _DEGEN_RECOVERY_TURNS = 4
@@ -130,6 +169,15 @@ _DEGEN_RECOVERY_NUDGE = (
     "Research tools are disabled for the next {n} turns; you may only use "
     "compile_oracle and run_oracle. Write the code and compile it — "
     "compiler errors are far more useful than further speculation."
+)
+
+_DEGEN_RECOVERY_NUDGE_POST_COMPILE = (
+    "Your thinking just entered an infinite loop — analysis paralysis. "
+    "STOP. Your oracle already compiles. The only remaining task is to fix "
+    "the runtime output so it produces INPUT/OUTPUT lines. "
+    "Use any tools you need to understand why the output is wrong, then "
+    "update the print statements, call compile_oracle with the revised code, "
+    "and call run_oracle to verify."
 )
 _EXTENSION_PROMPT = (
     "You have used all available turns. "
@@ -514,8 +562,9 @@ def _is_degenerate_thinking(
     from collections import Counter
     # Strip fenced code blocks before analysis — repeated constant initialisers,
     # parallel EXPECT_EQ lines, and array literals inside ```...``` are legitimate
-    # code, not degeneracy.
+    # code, not degeneracy. Also strip unclosed fences (agent cut off mid-block).
     prose = re.sub(r"```.*?```", "", thinking, flags=re.DOTALL)
+    prose = re.sub(r"```.*$", "", prose, flags=re.DOTALL)
     lines = [l.strip() for l in prose.splitlines()
              if len(l.strip()) >= min_line_len]
     if len(lines) < min_lines:
@@ -700,8 +749,9 @@ def _tool_list_methods(conn: sqlite3.Connection, class_name: str) -> str:
         out.append(f"{marker:<11} {qn}")
     out.append("")
     out.append(
-        "Only [public] members are callable from outside the class. "
-        "Picking [private] or [protected] will fail to compile."
+        "Only [public] members are callable by default. To call [private] or "
+        "[protected] methods from oracle.cc, use the '#define private public' "
+        "technique described in the system prompt."
     )
     return "\n".join(out)
 
@@ -843,8 +893,14 @@ def _tool_resolve_includes(code: str) -> str:
         # the compiler's built-in include path, not ALLOWED_READ_ROOTS, so
         # without this check they spuriously fail. A bracket form with no
         # path separator and a name in the stdlib allowlist is always OK.
+        # GCC implementation sub-directories (bits/, ext/, tr1/) are also
+        # compiler-internal and must be accepted without a source-tree search.
         if delim == "<" and "/" not in inc and inc in _STDLIB_HEADERS:
             lines.append(f'OK  {shown}  (C/C++ standard library)')
+            continue
+        _GCC_INTERNAL_PREFIXES = ("bits/", "ext/", "tr1/", "experimental/")
+        if delim == "<" and any(inc.startswith(p) for p in _GCC_INTERNAL_PREFIXES):
+            lines.append(f'OK  {shown}  (GCC compiler-internal header)')
             continue
 
         # Double-quoted includes with no path separator are local/relative
@@ -1200,8 +1256,11 @@ def _tool_find_symbol(symbol: str) -> str:
     return "\n".join(matches)
 
 
-def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable]:
-    """Return (compile_handler, run_handler) for the oracle agent loop."""
+def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, callable]:
+    """Return (compile_handler, run_handler, compiled_ok) for the oracle agent loop.
+
+    compiled_ok() returns True once at least one compile_oracle call has succeeded.
+    """
     from .compile import write_compile_script
 
     attempts    = [0]
@@ -1258,9 +1317,23 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable]:
         if len(lines) > 100:
             output = "\n".join(lines[:100]) + f"\n... ({len(lines) - 100} more lines)"
         status = "OK" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
-        return f"{status}\n{output}"
+        result = f"{status}\n{output}"
+        has_output_lines = any(l.startswith("OUTPUT") for l in lines)
+        if proc.returncode == 0 and not has_output_lines:
+            result += (
+                "\n\nWARNING: no OUTPUT lines detected. The function ran but "
+                "produced no observable output — it likely returned early or its "
+                "core logic was never reached. Re-read the function source, "
+                "identify what conditions are needed to reach the main body, "
+                "set up those inputs, add OUTPUT prints that capture the side "
+                "effects, and call compile_oracle again."
+            )
+        return result
 
-    return compile_handler, run_handler
+    def compiled_ok() -> bool:
+        return last_binary[0] is not None
+
+    return compile_handler, run_handler, compiled_ok
 
 
 def _dispatch(conn: sqlite3.Connection, name: str, args: dict) -> str:
@@ -1370,8 +1443,33 @@ def generate_with_agent(
 
     # Resolve caller class context once so we can tag in-class members.
     target_class = function_qname.rsplit("::", 1)[0] if "::" in function_qname else None
+    target_is_private = fn["access"] in ("private", "protected")
 
     parts: list[str] = []
+
+    # If the target function itself is private/protected, emit an upfront
+    # directive so the agent doesn't waste turns discovering it can't call it.
+    if target_is_private:
+        header_file = fn["file"]
+        parts.append(
+            f"## WARNING: `{function_qname}` is `{fn['access']}`\n\n"
+            f"You cannot call this function from external code without the "
+            f"`#define private public` technique. Use this exact pattern — "
+            f"`<bits/stdc++.h>` MUST be the first line so all standard-library "
+            f"include guards fire before the macro is active:\n\n"
+            f"```cpp\n"
+            f"#include <bits/stdc++.h>  // fires all std include guards first\n"
+            f"#include <mmdb2/mmdb_manager.h>\n"
+            f"// ... other mmdb/clipper/coot includes (NOT the target class header) ...\n\n"
+            f"#define private public\n"
+            f"#define protected public\n"
+            f'#include "{header_file}"\n'
+            f"#undef protected\n"
+            f"#undef private\n"
+            f"```\n\n"
+            f"With this in place you can call `{function_qname}` and assign "
+            f"any private member variables needed for setup."
+        )
 
     parts.append(f"## Function to observe: `{function_qname}`")
     meta = [f"- **File:** `{fn['file']}`"]
@@ -1390,16 +1488,19 @@ def generate_with_agent(
     callers = get_callers_with_source(conn, fn["id"], limit=3)
     if callers:
         parts.append("## Example callers")
-        parts.append("_Reference only — do NOT copy private-member access into oracle.cc._")
+        parts.append(
+            "_Reference only. In-class callers can access private members directly; "
+            "oracle.cc must use `#define private public` to do the same (see system prompt)._"
+        )
         for i, c in enumerate(callers, 1):
             rel = c["file"].replace(PROJECT_ROOT + "/", "")
             caller_cls = get_containing_class(conn, c["qualified_name"])
             caller_cls_qname = caller_cls["qualified_name"] if caller_cls else None
             in_class = target_class is not None and caller_cls_qname == target_class
             access_note = (
-                "in-class member — has PRIVATE access, oracle does NOT"
+                "in-class member — accesses private state directly (use `#define private public` to replicate)"
                 if in_class else
-                "external caller — public API only"
+                "external caller"
             )
             parts.append(f"### Caller {i}/{len(callers)}: `{c['qualified_name']}`")
             caller_meta = [f"- **File:** `{rel}`"]
@@ -1448,13 +1549,16 @@ def generate_with_agent(
     trace_lines.append(f"=== AGENT TRACE: {function_qname} ===\n")
     trace_lines.append(f"[user]\n{textwrap.indent(user_content, '  ')}\n")
 
-    compile_handler, run_handler = (
-        _make_oracle_tool_handlers(oracle_out) if oracle_out else (None, None)
+    compile_handler, run_handler, compiled_ok = (
+        _make_oracle_tool_handlers(oracle_out) if oracle_out else (None, None, lambda: False)
     )
 
     def dispatch(name: str, args: dict) -> str:
         if name == "compile_oracle" and compile_handler:
-            return compile_handler(args["code"])
+            code = args.get("code")
+            if code is None:
+                return "Error: compile_oracle called without a 'code' argument."
+            return compile_handler(code)
         if name == "run_oracle" and run_handler:
             return run_handler()
         if name in ("compile_oracle", "run_oracle"):
@@ -1576,7 +1680,11 @@ def generate_with_agent(
                 messages[-1] = {"role": "assistant",
                                 "content": "[thinking loop truncated]",
                                 "tool_calls": []}
-            recovery_msg = _DEGEN_RECOVERY_NUDGE.format(n=_DEGEN_RECOVERY_TURNS)
+            template = (
+                _DEGEN_RECOVERY_NUDGE_POST_COMPILE if compiled_ok()
+                else _DEGEN_RECOVERY_NUDGE
+            )
+            recovery_msg = template.format(n=_DEGEN_RECOVERY_TURNS)
             messages.append({"role": "user", "content": recovery_msg})
             trace_lines.append(f"[recovery nudge]\n{textwrap.indent(recovery_msg, '  ')}\n")
             continue

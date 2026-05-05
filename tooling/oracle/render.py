@@ -24,23 +24,19 @@ _ACCESS_LABELS = ("public:", "protected:", "private:")
 
 
 def caller_class_fields(conn: sqlite3.Connection, caller_qname: str) -> str | None:
-    """Return a terse listing of PUBLIC field declarations for the class that
-    contains caller_qname.
+    """Return a terse listing of field declarations for the class that contains
+    caller_qname, grouped by access level.
 
-    Non-public fields are suppressed: oracle.cc is external code and cannot
-    reach private/protected members. Methods and structural lines are
-    filtered out — only fields survive. Returns None if there are no usable
-    public fields.
+    All fields (public, protected, private) are shown so the agent knows the
+    names available via `#define private public`. Methods are filtered out —
+    only data members survive. Returns None if there are no fields.
     """
     cls = get_containing_class(conn, caller_qname)
     if not cls or not cls["summary"]:
         return None
 
-    current_access = "public"  # assume public until we see an access label
-    # For a `class`, the true default is private — but we don't know whether
-    # this summary is a class or a struct here. The access labels emitted by
-    # extract_graph.py's type_summary make the first section unambiguous.
-    fields: list[str] = []
+    current_access = "public"
+    buckets: dict[str, list[str]] = {"public": [], "protected": [], "private": []}
     for line in cls["summary"].splitlines():
         stripped = line.strip()
         if not stripped:
@@ -52,13 +48,17 @@ def caller_class_fields(conn: sqlite3.Connection, caller_qname: str) -> str | No
             continue
         if "(" in stripped:
             continue  # method signature, not a field
-        if current_access != "public":
-            continue
-        fields.append(line)
+        buckets[current_access].append(line)
 
-    if not fields:
+    all_fields: list[str] = []
+    for access in ("public", "protected", "private"):
+        if buckets[access]:
+            all_fields.append(f"  // {access}:")
+            all_fields.extend(buckets[access])
+
+    if not all_fields:
         return None
-    return f"// Public fields of {cls['qualified_name']}:\n" + "\n".join(fields)
+    return f"// Fields of {cls['qualified_name']}:\n" + "\n".join(all_fields)
 
 # mmdb::Manager key methods are inherited from mmdb::Root / mmdb::CoorMngrRoot
 # and don't appear on Manager directly, so we use a hardcoded setup pattern.

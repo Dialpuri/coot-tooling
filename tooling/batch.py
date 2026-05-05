@@ -28,7 +28,7 @@ Usage (file mode):
 from __future__ import annotations
 
 import argparse
-import itertools
+import queue
 import sys
 import traceback
 import urllib.error
@@ -42,8 +42,6 @@ from .test.generate import generate_test
 from .gemmi.generate import generate_gemmi
 from .gemmi.aggregate import aggregate_gemmi_files
 from .ollama import OLLAMA_HOSTS, set_host, get_host
-
-_task_seq = itertools.count()  # global task counter for host round-robin
 
 
 # ── result tracking ───────────────────────────────────────────────────────────
@@ -250,19 +248,25 @@ def _run_in_parallel(qnames: list[str], args, *, label: str = "") -> list[Result
     )
 
     hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
+    host_queue: queue.Queue[str] = queue.Queue()
+    for h in hosts:
+        host_queue.put(h)
 
-    def _process_with_host(qname: str, host: str) -> Result:
-        set_host(host)
-        return _process(qname, args.model, args.agent, args.verbose,
-                        args.skip_oracle, args.skip_existing,
-                        with_gemmi, args.overwrite)
+    def _process_with_host(qname: str) -> Result:
+        host = host_queue.get()
+        try:
+            set_host(host)
+            return _process(qname, args.model, args.agent, args.verbose,
+                            args.skip_oracle, args.skip_existing,
+                            with_gemmi, args.overwrite)
+        finally:
+            host_queue.put(host)
 
     out: list[Result] = []
     futures = {}
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for qname in qnames:
-            host = hosts[next(_task_seq) % len(hosts)]
-            f = pool.submit(_process_with_host, qname, host)
+            f = pool.submit(_process_with_host, qname)
             futures[f] = qname
         for f in as_completed(futures):
             r = f.result()
@@ -292,12 +296,19 @@ def _run_topo_waves(qnames: list[str], args) -> list[Result]:
         else not getattr(args, "no_gemmi", False)
     )
     hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
+    host_queue: queue.Queue[str] = queue.Queue()
+    for h in hosts:
+        host_queue.put(h)
 
-    def _process_with_host(qname: str, host: str) -> Result:
-        set_host(host)
-        return _process(qname, args.model, args.agent, args.verbose,
-                        args.skip_oracle, args.skip_existing,
-                        with_gemmi, args.overwrite)
+    def _process_with_host(qname: str) -> Result:
+        host = host_queue.get()
+        try:
+            set_host(host)
+            return _process(qname, args.model, args.agent, args.verbose,
+                            args.skip_oracle, args.skip_existing,
+                            with_gemmi, args.overwrite)
+        finally:
+            host_queue.put(host)
 
     # pending[q] = set of in-batch deps not yet completed
     pending: dict[str, set[str]] = {q: set(deps.get(q, set())) for q in qnames}
@@ -307,8 +318,7 @@ def _run_topo_waves(qnames: list[str], args) -> list[Result]:
     def _submit_ready(pool) -> None:
         for q in list(pending):
             if not pending[q]:
-                host = hosts[next(_task_seq) % len(hosts)]
-                f = pool.submit(_process_with_host, q, host)
+                f = pool.submit(_process_with_host, q)
                 in_flight[f] = q
                 del pending[q]
 
