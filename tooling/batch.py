@@ -406,6 +406,70 @@ def _test_is_passing(out_dir: Path) -> bool:
     return ok
 
 
+def _is_context_size_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return (
+        "exceed_context_size_error" in msg
+        or "exceeds the available context size" in msg
+    )
+
+
+_CTX_SKIPS_LOCK = threading.Lock()
+
+
+def _record_context_size_skip(qname: str, sig_hash: str | None,
+                              phase: str, exc: BaseException) -> Path:
+    """Append a one-line note to generated-tests/context_size_skips.txt and
+    return the path. Thread-safe."""
+    path = OUT_ROOT / "context_size_skips.txt"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    short = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+    tag = f"{qname}#{sig_hash}" if sig_hash else qname
+    line = f"[{ts}] {phase:6}  {tag}  — {short}\n"
+    with _CTX_SKIPS_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(line)
+    return path
+
+
+def _maybe_evaluate(out_dir: Path, model: str, log) -> None:
+    """If any attempted stage failed, classify it with the evaluator and
+    persist evaluate/<stage>.json. Best-effort: never let evaluator errors
+    fail the batch.
+    """
+    try:
+        from .evaluate.detect import first_failing_stage
+        from .evaluate.evaluator import evaluate_trace
+        s = first_failing_stage(out_dir)
+        if s is None or not s.present:
+            return
+        trace_path = out_dir / s.name / "agent_trace.txt"
+        if not trace_path.exists():
+            return
+        out_file = out_dir / "evaluate" / f"{s.name}.json"
+        if out_file.exists():
+            return
+        log(f"evaluate: classifying {s.name} failure ...")
+        qname_from_dir = out_dir.name.replace("__", "::")
+        result = evaluate_trace(
+            qname=qname_from_dir, stage=s.name,
+            detection_reason=s.reason, trace_path=trace_path,
+            model=model,
+        )
+        out_file.parent.mkdir(exist_ok=True)
+        import json as _json
+        out_file.write_text(_json.dumps(result.to_dict(), indent=2))
+        log(f"evaluate: {s.name} → {result.failure_mode} ({result.confidence})")
+    except Exception as e:
+        if _is_context_size_error(e):
+            qname_from_dir = out_dir.name.replace("__", "::")
+            note = _record_context_size_skip(qname_from_dir, None, "evaluate", e)
+            log(f"evaluate: SKIPPED — prompt exceeds model context. Recorded in {note}")
+        else:
+            log(f"evaluate: skipped — {e}")
+
+
 def _process(
     qname: str,
     sig_hash: str | None,
@@ -417,6 +481,7 @@ def _process(
     with_gemmi: bool = False,
     overwrite: bool = False,
     commit: bool = False,
+    evaluate: bool = True,
 ) -> Result:
     r = Result(qname, sig_hash)
     out_dir = OUT_ROOT / sanitize_name(qname, sig_hash)
@@ -472,10 +537,19 @@ def _process(
         except urllib.error.URLError as e:
             log(f"oracle: FAILED — Ollama unreachable: {e}")
             r.error = f"Ollama unreachable: {e}"
+            # Skip evaluator: Ollama is down, classification would also fail.
             return r
         except Exception as e:
+            if _is_context_size_error(e):
+                note = _record_context_size_skip(qname, sig_hash, "oracle", e)
+                log(f"oracle: SKIPPED — prompt exceeds model context. Recorded in {note}")
+                r.skipped = True
+                r.error = f"context size exceeded: {str(e).splitlines()[0]}"
+                return r
             log(f"oracle: FAILED — {e}\n{traceback.format_exc()}")
             r.error = f"oracle failed: {e}"
+            if evaluate:
+                _maybe_evaluate(out_dir, model, log)
             return r
         finally:
             conn.close()
@@ -500,9 +574,18 @@ def _process(
             log("test: ok")
             r.test_ok = True
         except Exception as e:
+            if _is_context_size_error(e):
+                note = _record_context_size_skip(qname, sig_hash, "test", e)
+                log(f"test: SKIPPED — prompt exceeds model context. Recorded in {note}")
+                r.skipped = True
+                r.test_ok = False
+                r.error = f"context size exceeded: {str(e).splitlines()[0]}"
+                return r
             log(f"test: FAILED — {e}\n{traceback.format_exc()}")
             r.test_ok = False
             r.error = f"test generation failed: {e}"
+            if evaluate:
+                _maybe_evaluate(out_dir, model, log)
             return r
 
     # ── gemmi port phase (optional) ───────────────────────────────────────────
@@ -515,11 +598,20 @@ def _process(
             log("gemmi: ok")
             r.gemmi_ok = True
         except Exception as e:
-            log(f"gemmi: FAILED — {e}\n{traceback.format_exc()}")
-            r.gemmi_ok = False
-            r.error = f"gemmi port failed: {e}"
+            if _is_context_size_error(e):
+                note = _record_context_size_skip(qname, sig_hash, "gemmi", e)
+                log(f"gemmi: SKIPPED — prompt exceeds model context. Recorded in {note}")
+                r.skipped = True
+                r.gemmi_ok = False
+                r.error = f"context size exceeded: {str(e).splitlines()[0]}"
+            else:
+                log(f"gemmi: FAILED — {e}\n{traceback.format_exc()}")
+                r.gemmi_ok = False
+                r.error = f"gemmi port failed: {e}"
 
     log(f"DONE oracle={r.oracle_ok} test={r.test_ok} gemmi={r.gemmi_ok}")
+    if evaluate:
+        _maybe_evaluate(out_dir, model, log)
     _clear_worker_state()
     return r
 
@@ -572,7 +664,8 @@ def _run_in_parallel(
                 _process,
                 (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
-                 with_gemmi, args.overwrite, commit),
+                 with_gemmi, args.overwrite, commit,
+                 getattr(args, "evaluate", True)),
                 FUNCTION_DEADLINE_SECONDS,
                 qname, sig_hash,
             )
@@ -646,7 +739,8 @@ def _run_topo_waves(
                 _process,
                 (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
-                 with_gemmi, args.overwrite, commit),
+                 with_gemmi, args.overwrite, commit,
+                 getattr(args, "evaluate", True)),
                 FUNCTION_DEADLINE_SECONDS,
                 qname, sig_hash,
             )
@@ -815,6 +909,9 @@ def main() -> None:
                         help="Re-run all stages even if gemmi/function.hh + gemmi/test.cc already exist")
     parser.add_argument("--commit",        action="store_true",
                         help="Commit successful gemmi ports into the coot source tree")
+    parser.add_argument("--no-evaluate",   action="store_false", dest="evaluate", default=True,
+                        help="Skip running the failure-mode evaluator on any failing stage "
+                             "(default: evaluator runs and writes evaluate/<stage>.json)")
     parser.add_argument("--list",          action="store_true", help="List matching methods and exit")
     parser.add_argument("--dry-run",       action="store_true",
                         help="Print the resolved processing order and in-batch call graph, then exit")
@@ -891,7 +988,8 @@ def main() -> None:
                 _process,
                 (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
-                 args.with_gemmi, args.overwrite, args.commit),
+                 args.with_gemmi, args.overwrite, args.commit,
+                 args.evaluate),
                 FUNCTION_DEADLINE_SECONDS,
                 qname, sig_hash,
             )
@@ -953,6 +1051,9 @@ def main_file() -> None:
                         help="Re-run all stages even if gemmi/function.hh + gemmi/test.cc already exist")
     parser.add_argument("--commit",        action="store_true",
                         help="Commit successful gemmi ports into the coot source tree")
+    parser.add_argument("--no-evaluate",   action="store_false", dest="evaluate", default=True,
+                        help="Skip running the failure-mode evaluator on any failing stage "
+                             "(default: evaluator runs and writes evaluate/<stage>.json)")
     parser.add_argument("--list",          action="store_true",  help="List matching functions and exit")
     parser.add_argument("--dry-run",       action="store_true",
                         help="Print the resolved processing order and in-batch call graph, then exit")
@@ -1030,7 +1131,8 @@ def main_file() -> None:
                 _process,
                 (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
-                 with_gemmi, args.overwrite, False),
+                 with_gemmi, args.overwrite, False,
+                 args.evaluate),
                 FUNCTION_DEADLINE_SECONDS,
                 qname, sig_hash,
             )

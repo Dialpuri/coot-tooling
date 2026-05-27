@@ -1312,6 +1312,21 @@ def _make_tool_handlers(
     last_binary    = [None]
     last_error_log = [None]
     assertion_warned = [False]
+    draft_seq      = [0]
+
+    def _save_drafts(files: dict[str, str | None]) -> None:
+        """Snapshot the current state of each provided file under
+        gemmi/drafts/NNN_<filename>. Skip entries whose content is None/empty.
+        All files written in the same compile attempt share the same sequence
+        number so they can be browsed as a unit.
+        """
+        draft_seq[0] += 1
+        drafts_dir = gemmi_subdir / "drafts"
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        for fname, content in files.items():
+            if not content:
+                continue
+            (drafts_dir / f"{draft_seq[0]:03d}_{fname}").write_text(content)
 
     def compile_handler(function_hh: str, test_cc: str,
                         function_cc: str | None = None) -> str:
@@ -1386,6 +1401,12 @@ def _make_tool_handlers(
             if cc_path.exists():
                 cc_path.unlink()
             fn_cc_arg = None
+
+        _save_drafts({
+            "function.hh": function_hh,
+            "function.cc": function_cc,
+            "test.cc": test_cc,
+        })
 
         write_compile_script(
             gemmi_subdir,

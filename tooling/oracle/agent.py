@@ -969,6 +969,21 @@ def _tool_lookup_type(conn: sqlite3.Connection, name: str) -> str:
         return "\n".join(lines)
     row = candidates[0] if candidates else get_type(conn, name)
     if not row:
+        # Symmetric to search_functions: the agent sometimes calls lookup_type
+        # with a function name. If the miss matches functions, redirect.
+        fn_hits = conn.execute(
+            "SELECT DISTINCT qualified_name FROM functions "
+            "WHERE qualified_name LIKE ? LIMIT 10",
+            (f"%{name}%",),
+        ).fetchall()
+        if fn_hits:
+            lines = [
+                f"Type '{name}' not found. This looks like a FUNCTION — "
+                f"use lookup_function or search_functions. Candidates:"
+            ]
+            for r in fn_hits:
+                lines.append(f"  {r[0]}")
+            return "\n".join(lines)
         return f"Type '{name}' not found in DB."
     methods = get_type_methods(conn, row["qualified_name"])
     lines = [f"// {row['kind']} {row['qualified_name']}  ({row['file']})"]
@@ -1262,10 +1277,29 @@ def _tool_search_functions(conn: sqlite3.Connection, name_fragment: str) -> str:
     if rows:
         return "\n".join(r[0] for r in rows)
 
-    # Zero hits — common cause is a wrong namespace prefix (e.g. searching
-    # 'coot::molecules_container_t::' when the class is actually global).
-    # Retry with just the tail after the last '::' and, if THAT matches,
-    # return the results with a heads-up.
+    # Zero function hits. Before namespace-tail retry, check if the fragment
+    # is actually a TYPE — the agent regularly confuses search_functions with
+    # lookup_type, and showing function lookalikes for a type query (e.g.
+    # 'mmdb::mmcif::PData' → 'mmdb::ExpData::...') is pure noise.
+    type_hits = get_types_matching(conn, name_fragment)
+    if not type_hits and "::" in name_fragment:
+        tail = name_fragment.rsplit("::", 1)[-1]
+        if tail:
+            type_hits = get_types_matching(conn, tail)
+    if type_hits:
+        lines = [
+            f"No function named '{name_fragment}'. This looks like a TYPE — "
+            f"use lookup_type instead. Candidates:"
+        ]
+        for t in type_hits[:10]:
+            lines.append(f"  {t['qualified_name']}  ({t['file']})")
+        if len(type_hits) > 10:
+            lines.append(f"  … and {len(type_hits) - 10} more")
+        return "\n".join(lines)
+
+    # Genuine function miss — common cause is a wrong namespace prefix
+    # (e.g. searching 'coot::molecules_container_t::' when the class is
+    # actually global). Retry with just the tail after the last '::'.
     if "::" in name_fragment:
         tail = name_fragment.rsplit("::", 1)[-1] or name_fragment.rsplit("::", 2)[-2]
         if tail and tail != name_fragment:
@@ -1281,7 +1315,10 @@ def _tool_search_functions(conn: sqlite3.Connection, name_fragment: str) -> str:
                     f"(verify the qualified name before using):\n"
                     + "\n".join(r[0] for r in retry)
                 )
-    return f"No functions matching '{name_fragment}'."
+    return (
+        f"No functions matching '{name_fragment}'. "
+        f"If this is a type, call lookup_type; for free text, try grep_codebase."
+    )
 
 
 _GREP_EXTS = {".cc", ".cpp", ".cxx", ".c", ".h", ".hh", ".hpp", ".hxx"}
@@ -1643,6 +1680,17 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
 
     attempts    = [0]
     last_binary = [None]
+    draft_seq   = [0]
+
+    def _save_draft(filename: str, content: str, kind: str) -> None:
+        """Snapshot the current file under oracle/drafts/NNN_<kind>_<filename>.
+        kind is "compile" or "patch" so the reviewer can tell them apart.
+        """
+        draft_seq[0] += 1
+        drafts_dir = oracle_out / "drafts"
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        out = drafts_dir / f"{draft_seq[0]:03d}_{kind}_{filename}"
+        out.write_text(content)
 
     def compile_handler(code: str) -> str:
         if attempts[0] >= _MAX_COMPILE_ATTEMPTS:
@@ -1668,6 +1716,7 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
         oracle_cc = oracle_out / "oracle.cc"
         oracle_bin = oracle_out / "oracle"
         oracle_cc.write_text(code)
+        _save_draft("oracle.cc", code, "compile")
         write_compile_script(oracle_out)
         try:
             proc = subprocess.run(
@@ -1708,11 +1757,11 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
         try:
             proc = subprocess.run(
                 [str(last_binary[0].absolute())],
-                capture_output=True, text=True, cwd=str(oracle_out),
+                capture_output=True, cwd=str(oracle_out),
                 timeout=20,
             )
         except subprocess.TimeoutExpired as exc:
-            partial = (exc.stdout or "") + (exc.stderr or "")
+            partial = (exc.stdout or b"") + (exc.stderr or b"")
             if isinstance(partial, bytes):
                 partial = partial.decode(errors="replace")
             return (
@@ -1720,7 +1769,9 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
                 "Likely an infinite loop or a blocking call. Partial output:\n"
                 + partial[-2000:]
             )
-        output = (proc.stdout + proc.stderr).strip()
+        stdout = proc.stdout.decode(errors="replace") if proc.stdout else ""
+        stderr = proc.stderr.decode(errors="replace") if proc.stderr else ""
+        output = (stdout + stderr).strip()
         lines = output.splitlines()
         if len(lines) > 100:
             output = "\n".join(lines[:100]) + f"\n... ({len(lines) - 100} more lines)"

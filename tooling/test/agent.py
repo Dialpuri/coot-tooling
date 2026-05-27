@@ -222,6 +222,13 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
     attempts       = [0]
     last_binary    = [None]   # Path | None — set when a compile succeeds
     last_error_log = [None]   # Path | None
+    draft_seq      = [0]
+
+    def _save_draft(filename: str, content: str) -> None:
+        draft_seq[0] += 1
+        drafts_dir = test_subdir / "drafts"
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        (drafts_dir / f"{draft_seq[0]:03d}_{filename}").write_text(content)
 
     def compile_handler(code: str) -> str:
         if attempts[0] >= MAX_COMPILE_ATTEMPTS:
@@ -246,6 +253,7 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
         test_cc  = test_subdir / "test.cc"
         test_bin = test_subdir / "test_check"
         test_cc.write_text(code)
+        _save_draft("test.cc", code)
 
         success, output = compile_test_cc(test_cc, test_bin)
 
