@@ -18,6 +18,9 @@ from ..oracle.agent import (
     _chat,
     _log_llm_timing,
     _is_degenerate_thinking,
+    loop_guard_intercept,
+    _is_empty_lookup_result,
+    LOOKUP_TOOLS_FOR_CAP,
     NUDGE_EVERY_N_TURNS,
     NO_COMPILE_AFTER,
 )
@@ -36,6 +39,7 @@ _TEST_NO_COMPILE_NUDGE = (
     "than further speculation. Failures are expected — you have multiple "
     "retries to fix them. Action over analysis."
 )
+from ..oracle.render import construction_overrides_for_function
 from ..oracle.notes import load_notes, render_notes_for_prompt
 from ..oracle.coverage import load_coverage, render_for_prompt as render_coverage_for_prompt
 from ..oracle.runner.results import OracleResult
@@ -422,6 +426,15 @@ def generate_test_with_agent(
             )
             parts.append(f"```\n{rendered.rstrip()}\n```")
 
+    # Curated construction recipes for any hard type the oracle had to build
+    # (protein_geometry, restraints_container_t, clipper::Xmap, ...). The test
+    # must reproduce that construction exactly; surfacing the recipe here is
+    # aimed at the test-stage bad_construction failures (e.g. an uninitialised
+    # Xmap that segfaults Clipper's interpolation).
+    for dep_qname, dep_text in construction_overrides_for_function(oracle_cc_text):
+        parts.append(f"## How to construct `{dep_qname}` (curated)")
+        parts.append(f"```cpp\n{dep_text.rstrip()}\n```")
+
     parts.append("## Task")
     parts.append(
         "Convert the oracle into a Google Test suite. Use the tools to verify "
@@ -453,6 +466,10 @@ def generate_test_with_agent(
     REPEAT_LIMIT = 3
     NO_CACHE = {"write_and_compile_test", "run_test", "get_compile_errors", "patch_test", "leave_note"}
     no_compile_warned = [False]
+    # Shared loop-guard state (fuzzy near-duplicate + empty-result streak +
+    # hard lookup cap before the first compile). The test agent previously had
+    # no lookup cap at all.
+    guard_state: dict = {"fuzzy": {}, "empty_streak": 0, "lookups": 0}
 
     def _save_draft(code: str) -> None:
         if code and len(code) > 100 and "#include" in code:
@@ -494,10 +511,36 @@ def generate_test_with_agent(
                 trace_lines.append_call(f"[repeat-intercept] {name}({json.dumps(hash_args)})")
                 results.append({"role": "tool", "content": nudge})
                 continue
+
+            # Shared loop guard: fuzzy near-duplicate exploration, empty-result
+            # streaks, and a hard lookup cap before the first compile attempt.
+            has_compiled_yet = any(
+                k.startswith("write_and_compile_test:") for k in call_counts
+            )
+            guard_msg = loop_guard_intercept(
+                name, args,
+                has_compiled=has_compiled_yet,
+                state=guard_state,
+                compile_tool="write_and_compile_test",
+            )
+            if guard_msg is not None:
+                trace_lines.append(f"  → [loop-guard] {name}({json.dumps(hash_args)})")
+                trace_lines.append_call(f"[loop-guard] {name}({json.dumps(hash_args)})")
+                results.append({"role": "tool", "content": guard_msg})
+                continue
+
             if verbose:
                 display = {"code": "..."} if name == "write_and_compile_test" else args
                 print(f"  tool: {name}({display})")
             result_text  = dispatch(name, args)
+
+            # Feed the empty-result streak consumed by the shared loop guard.
+            if name in LOOKUP_TOOLS_FOR_CAP and not has_compiled_yet:
+                if _is_empty_lookup_result(result_text):
+                    guard_state["empty_streak"] += 1
+                else:
+                    guard_state["empty_streak"] = 0
+
             result_lines = result_text.splitlines()
             if len(result_lines) > 150:
                 result_text = (

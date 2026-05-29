@@ -64,6 +64,7 @@ def _resolve_stage(func_dir: Path, stage: str | None) -> tuple[str, str] | None:
 def _evaluate_one(func_dir: Path, *, stage: str | None,
                   model: str, write: bool,
                   skip_existing: bool = False,
+                  redo_ran_out_of_turns: bool = False,
                   quiet: bool = False) -> EvaluationResult | None:
     def _say(msg: str) -> None:
         if not quiet:
@@ -78,8 +79,19 @@ def _evaluate_one(func_dir: Path, *, stage: str | None,
 
     out_file = func_dir / "evaluate" / f"{stage_name}.json"
     if skip_existing and out_file.exists():
-        _say(f"[skip] {func_dir.name}: {out_file.name} exists")
-        return None
+        if redo_ran_out_of_turns:
+            try:
+                existing = json.loads(out_file.read_text())
+                if existing.get("failure_mode") == "ran_out_of_turns":
+                    _say(f"[redo] {func_dir.name}: re-evaluating ran_out_of_turns result")
+                else:
+                    _say(f"[skip] {func_dir.name}: {out_file.name} exists")
+                    return None
+            except Exception:
+                pass
+        else:
+            _say(f"[skip] {func_dir.name}: {out_file.name} exists")
+            return None
 
     trace_path = func_dir / stage_name / "agent_trace.txt"
     if not trace_path.exists():
@@ -117,8 +129,9 @@ def _evaluate_one(func_dir: Path, *, stage: str | None,
 
 
 def _evaluate_many(dirs: list[Path], *, stage: str | None, model: str,
-                   write: bool, skip_existing: bool, workers: int,
-                   hosts: list[str], progress: bool = False) -> list[EvaluationResult]:
+                   write: bool, skip_existing: bool, redo_ran_out_of_turns: bool,
+                   workers: int, hosts: list[str],
+                   progress: bool = False) -> list[EvaluationResult]:
     """Run _evaluate_one across dirs with a thread pool, one Ollama host per worker."""
     if progress:
         from tqdm import tqdm
@@ -137,6 +150,7 @@ def _evaluate_many(dirs: list[Path], *, stage: str | None, model: str,
         for d in dirs:
             r = _evaluate_one(d, stage=stage, model=model,
                               write=write, skip_existing=skip_existing,
+                              redo_ran_out_of_turns=redo_ran_out_of_turns,
                               quiet=progress)
             _advance()
             if r is not None:
@@ -155,6 +169,7 @@ def _evaluate_many(dirs: list[Path], *, stage: str | None, model: str,
             _set_worker_host(h)
             return _evaluate_one(d, stage=stage, model=model,
                                  write=write, skip_existing=skip_existing,
+                                 redo_ran_out_of_turns=redo_ran_out_of_turns,
                                  quiet=progress)
         finally:
             host_queue.put(h)
@@ -196,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
                          "Hosts are round-robin assigned from OLLAMA_HOSTS.")
     ap.add_argument("--skip-existing", action="store_true",
                     help="Skip dirs whose evaluate/<stage>.json already exists.")
+    ap.add_argument("--redo-ran-out-of-turns", action="store_true",
+                    help="With --skip-existing: re-evaluate any result previously "
+                         "classified as ran_out_of_turns instead of skipping it.")
     ap.add_argument("--progress", action="store_true",
                     help="Suppress per-item output and show only a tqdm progress bar "
                          "(requires --all).")
@@ -226,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         results = _evaluate_many(
             dirs, stage=args.stage, model=args.model,
             write=not args.no_write, skip_existing=args.skip_existing,
+            redo_ran_out_of_turns=args.redo_ran_out_of_turns,
             workers=args.workers, hosts=hosts, progress=args.progress,
         )
         from collections import Counter
@@ -259,7 +278,8 @@ def main(argv: list[str] | None = None) -> int:
         set_host(hosts[0])
     r = _evaluate_one(args.path, stage=args.stage, model=args.model,
                       write=not args.no_write,
-                      skip_existing=args.skip_existing)
+                      skip_existing=args.skip_existing,
+                      redo_ran_out_of_turns=args.redo_ran_out_of_turns)
     return 0 if r is not None else 1
 
 

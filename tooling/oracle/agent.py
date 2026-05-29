@@ -33,7 +33,7 @@ from ..db import (
     get_class_methods_with_access,
     get_containing_class,
 )
-from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNIPPET, caller_class_fields
+from .render import INCLUDE_ROOTS, _to_include, _load_override, construction_overrides_for_function, MMDB_MANAGER_SNIPPET, caller_class_fields
 from ..llm import chat as _chat
 
 
@@ -89,6 +89,127 @@ LOOKUP_TOOLS_FOR_CAP: frozenset[str] = frozenset({
     "get_callers", "find_header", "resolve_includes", "search_functions",
     "grep_codebase", "inspect_pdb", "get_base_classes", "find_symbol",
 })
+
+# Near-duplicate (fuzzy) repeat cap. Exact-arg repeat detection misses the two
+# commonest loop shapes seen in eval: read_file walking the *same file* at
+# drifting offsets (2070, 2150, 2200, ...) and grep/search re-issued with
+# lightly mutated patterns. _fuzzy_lookup_key collapses those to one signature;
+# once it is seen this many times we refuse and force a compile. Set 0 to disable.
+FUZZY_REPEAT_LIMIT = int(os.environ.get("CT_FUZZY_REPEAT_CAP", 3))
+
+# Consecutive empty-result streak cap. When this many lookups in a row come back
+# empty ("No matches" / "not found") and nothing has compiled yet, the agent is
+# almost certainly chasing a symbol that does not exist (e.g. GetResidue_gemmi,
+# get_restraints_container, write_pdb_file). Refuse further searches and force a
+# best-effort compile. Set 0 to disable.
+EMPTY_STREAK_LIMIT = int(os.environ.get("CT_EMPTY_STREAK_CAP", 4))
+
+# Markers that indicate a lookup returned nothing useful. Matched case-insensitively
+# against the head of the tool result.
+_EMPTY_RESULT_MARKERS = (
+    "no matches", "not found", "no results", "0 matches", "could not find",
+)
+
+
+def _fuzzy_lookup_key(name: str, args: dict) -> str | None:
+    """Normalised signature for near-duplicate lookup detection.
+
+    Collapses the loop shapes that exact-arg matching misses:
+      * read_file at drifting offsets  -> keyed on the path alone
+      * grep/search with mutated patterns -> keyed on the alnum core of the term
+
+    Returns None for tools we don't fuzzy-track (compile/run and anything
+    without a meaningful target argument)."""
+    if name == "read_file":
+        path = args.get("path") or ""
+        return f"read_file::{path}" if path else None
+    term_keys = {
+        "grep_codebase":    "pattern",
+        "search_functions": "name_fragment",
+        "find_symbol":      "symbol",
+        "find_header":      "name",
+        "lookup_type":      "name",
+        "lookup_function":  "qualified_name",
+        "get_callers":      "qualified_name",
+        "list_methods":     "class_name",
+        "get_base_classes": "name",
+    }
+    arg_name = term_keys.get(name)
+    if arg_name is None:
+        return None
+    raw = args.get(arg_name) or ""
+    core = re.sub(r"[^a-z0-9]", "", str(raw).lower())
+    return f"{name}::{core}" if core else None
+
+
+def _is_empty_lookup_result(text: str) -> bool:
+    """True if a lookup result clearly found nothing (head-of-text heuristic)."""
+    head = (text or "")[:200].lower()
+    return any(m in head for m in _EMPTY_RESULT_MARKERS)
+
+
+def loop_guard_intercept(
+    name: str,
+    args: dict,
+    *,
+    has_compiled: bool,
+    state: dict,
+    compile_tool: str,
+    lookup_cap: int = LOOKUPS_BEFORE_COMPILE_CAP,
+    fuzzy_limit: int = FUZZY_REPEAT_LIMIT,
+    empty_streak_limit: int = EMPTY_STREAK_LIMIT,
+) -> str | None:
+    """Pre-dispatch loop guard shared by the oracle/test/gemmi agents.
+
+    Returns an intercept message to send back to the model *in place of*
+    running the tool, or None to let the call proceed. Acts only on lookup
+    tools; compile/run tools always pass straight through.
+
+    `state` is a mutable dict owned by the caller's session, holding the keys
+    "fuzzy" (dict), "empty_streak" (int) and "lookups" (int). The caller is
+    responsible for updating state["empty_streak"] *after* dispatch based on
+    whether the result was empty (this guard cannot see the result yet)."""
+    if name not in LOOKUP_TOOLS_FOR_CAP:
+        return None
+
+    # 1. Near-duplicate exploration (drifting offsets / mutated patterns).
+    fkey = _fuzzy_lookup_key(name, args)
+    if fkey and fuzzy_limit:
+        fuzzy = state.setdefault("fuzzy", {})
+        fuzzy[fkey] = fuzzy.get(fkey, 0) + 1
+        if fuzzy[fkey] > fuzzy_limit:
+            target = fkey.split("::", 1)[1]
+            return (
+                f"BLOCKED: you have already explored '{target}' {fuzzy[fkey]} times "
+                "(only the offset/pattern is changing). You will not learn more by "
+                f"looking again — use what you have and call {compile_tool} with your "
+                "best draft. This block does not count against your compile budget."
+            )
+
+    # 2. Consecutive empty-result streak (chasing a symbol that does not exist).
+    if (not has_compiled and empty_streak_limit
+            and state.get("empty_streak", 0) >= empty_streak_limit):
+        return (
+            f"BLOCKED: your last {state['empty_streak']} searches all came back empty "
+            "— the symbol you are looking for almost certainly does not exist in this "
+            "codebase. Stop searching. Implement the conversion inline (or pick a known "
+            f"API) and call {compile_tool}. This block does not count against your "
+            "compile budget."
+        )
+
+    # 3. Hard lookup cap before the first compile attempt.
+    if (not has_compiled and lookup_cap
+            and state.get("lookups", 0) >= lookup_cap):
+        return (
+            f"BLOCKED: you have made {state['lookups']} lookups without a single "
+            f"{compile_tool} attempt (cap {lookup_cap}). Your next call MUST be "
+            f"{compile_tool} with your best draft — compiler errors guide you far "
+            "better than more speculation, and failures are expected (you have "
+            "multiple retries). This block does not count against your compile budget."
+        )
+
+    state["lookups"] = state.get("lookups", 0) + 1
+    return None
 
 NOTES_DIR        = Path(__file__).parent / "notes"
 ANSWER_MARKER    = "## Answer"
@@ -1977,6 +2098,17 @@ def generate_with_agent(
             parts.append(f"## How to construct `{target_class}`")
             parts.append(f"```cpp\n{override.rstrip()}\n```")
 
+    # Curated construction recipes for hard dependency types the function
+    # references (e.g. protein_geometry&, clipper::Xmap) beyond the receiver —
+    # the recipes the eval shows agents burning turns rediscovering.
+    for dep_qname, dep_text in construction_overrides_for_function(
+        fn["source_code"] or "",
+        exclude_qname=target_class,
+        pdb_path=str(selected_pdb_path),
+    ):
+        parts.append(f"## How to construct `{dep_qname}` (curated)")
+        parts.append(f"```cpp\n{dep_text.rstrip()}\n```")
+
     user_content = "\n\n".join(parts)
 
     system_prompt = make_agent_system_prompt(str(selected_pdb_path), pdb_note)
@@ -2050,6 +2182,10 @@ def generate_with_agent(
     # Fresh lookup calls (i.e. NOT cached, NOT intercepted) before the first
     # compile_oracle. Used by the lookup-cap gate below.
     lookup_count = [0]
+    # Shared loop-guard state (fuzzy near-duplicate + empty-result streak). The
+    # oracle keeps its own hard lookup cap above, so we run the shared guard
+    # with lookup_cap=0 (fuzzy + empty-streak only).
+    guard_state: dict = {"fuzzy": {}, "empty_streak": 0, "lookups": 0}
     # Tools whose output may differ across calls or which have side effects —
     # never serve from cache.
     NO_CACHE = {"compile_oracle", "run_oracle", "patch_oracle", "leave_note"}
@@ -2107,15 +2243,34 @@ def generate_with_agent(
                 results.append({"role": "tool", "content": nudge})
                 continue
 
+            has_compiled_yet = any(
+                k.startswith("compile_oracle:") for k in call_counts
+            )
+
+            # Shared loop guard: catches near-duplicate exploration (drifting
+            # read offsets / mutated grep patterns) and empty-result streaks
+            # that exact-arg repeat detection misses. The oracle keeps its own
+            # hard lookup cap below, so run the shared guard with lookup_cap=0.
+            guard_msg = loop_guard_intercept(
+                name, args,
+                has_compiled=has_compiled_yet,
+                state=guard_state,
+                compile_tool="compile_oracle",
+                lookup_cap=0,
+            )
+            if guard_msg is not None:
+                trace_lines.append(f"  → [loop-guard] {name}({json.dumps(hash_args)})")
+                trace_lines.append(textwrap.indent(guard_msg, "      ") + "\n")
+                trace_lines.append_call(f"[loop-guard] {name}({json.dumps(hash_args)})")
+                results.append({"role": "tool", "content": guard_msg})
+                continue
+
             # Hard lookup cap: once the agent has burned LOOKUPS_BEFORE_COMPILE_CAP
             # fresh lookup calls without ever calling compile_oracle, block
             # every further lookup until it compiles. The system prompt asks
             # for the same cap as prose; this gate makes it bind. Cached and
             # already-intercepted calls don't reach here so they don't burn
             # the budget. Compile + run tools always go through unimpeded.
-            has_compiled_yet = any(
-                k.startswith("compile_oracle:") for k in call_counts
-            )
             if (LOOKUPS_BEFORE_COMPILE_CAP > 0
                     and not has_compiled_yet
                     and name in LOOKUP_TOOLS_FOR_CAP):
@@ -2145,6 +2300,13 @@ def generate_with_agent(
             if verbose:
                 print(f"  tool: {name}({args})")
             result = dispatch(name, args)
+
+            # Feed the empty-result streak consumed by the shared loop guard.
+            if name in LOOKUP_TOOLS_FOR_CAP and not has_compiled_yet:
+                if _is_empty_lookup_result(result):
+                    guard_state["empty_streak"] += 1
+                else:
+                    guard_state["empty_streak"] = 0
 
             # Capture the draft that actually compiled. We can only trust a
             # draft for rescue / downstream use once compile_oracle has

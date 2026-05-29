@@ -28,6 +28,9 @@ from ..oracle.agent import (
     _log_llm_timing,
     _is_degenerate_thinking,
     _has_compile_intent,
+    loop_guard_intercept,
+    _is_empty_lookup_result,
+    LOOKUP_TOOLS_FOR_CAP,
     NUDGE_EVERY_N_TURNS,
     NO_COMPILE_AFTER,
 )
@@ -1886,6 +1889,10 @@ def generate_gemmi_port_with_agent(
     compile_intent_strikes = [0]
     non_compile_tool_calls = [0]
     no_tool_nudge_sent = [False]
+    # Shared loop-guard state (fuzzy near-duplicate + empty-result streak +
+    # hard lookup cap before the first write/compile). The gemmi agent
+    # previously had no lookup cap at all.
+    guard_state: dict = {"fuzzy": {}, "empty_streak": 0, "lookups": 0}
 
     def _save_draft_from_compile(args: dict, compile_result: str) -> None:
         # Only save when the compile + test run actually succeeded — otherwise
@@ -1945,12 +1952,40 @@ def generate_gemmi_port_with_agent(
                 trace_lines.append_call(f"[repeat-intercept] {name}({json.dumps(hash_args)})")
                 results.append({"role": "tool", "content": nudge})
                 continue
+
+            # Shared loop guard: fuzzy near-duplicate exploration, empty-result
+            # streaks, and a hard lookup cap before the first write/compile.
+            # Writing test.cc via write_gemmi_file auto-compiles, so either tool
+            # counts as "has produced code".
+            has_compiled_yet = any(
+                k.startswith("compile_gemmi:") or k.startswith("write_gemmi_file:")
+                for k in call_counts
+            )
+            guard_msg = loop_guard_intercept(
+                name, args,
+                has_compiled=has_compiled_yet,
+                state=guard_state,
+                compile_tool="write_gemmi_file",
+            )
+            if guard_msg is not None:
+                trace_lines.append(f"  → [loop-guard] {name}({json.dumps(hash_args)})")
+                trace_lines.append_call(f"[loop-guard] {name}({json.dumps(hash_args)})")
+                results.append({"role": "tool", "content": guard_msg})
+                continue
+
             if verbose:
                 display = ({"function_hh": "...", "test_cc": "...",
                             "function_cc": "..." if args.get("function_cc") else None}
                            if name == "compile_gemmi" else args)
                 print(f"  tool: {name}({display})")
             result_text = dispatch(name, args)
+
+            # Feed the empty-result streak consumed by the shared loop guard.
+            if name in LOOKUP_TOOLS_FOR_CAP and not has_compiled_yet:
+                if _is_empty_lookup_result(result_text):
+                    guard_state["empty_streak"] += 1
+                else:
+                    guard_state["empty_streak"] = 0
             # Save draft AFTER compile so we know whether it actually passed.
             # Saving before would let a failed-compile draft become the rescue
             # fallback, which then fails again at verify time.

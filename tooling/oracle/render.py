@@ -249,27 +249,102 @@ def _short_name(qname: str) -> str:
 
 OVERRIDES_DIR = Path(__file__).parent / "overrides"
 
+# Override files whose filename stem does NOT follow the qname.replace("::","__")
+# convention. Maps a type qname to its file stem so _load_override can find it.
+# (e.g. clipper::Xmap<float> lives in overrides/xmap.cc, not clipper__Xmap.cc)
+_OVERRIDE_ALIASES: dict[str, str] = {
+    "clipper::Xmap": "xmap",
+}
 
-def _load_override(type_qname: str, pdb_path: str | None = None) -> str | None:
+
+def _override_stem_for(type_qname: str) -> str:
+    return _OVERRIDE_ALIASES.get(type_qname, type_qname.replace("::", "__"))
+
+
+def _load_override(
+    type_qname: str,
+    pdb_path: str | None = None,
+    mtz_path: str | None = None,
+) -> str | None:
     """Return the contents of an override file for type_qname, or None.
 
     Files are named by replacing '::' with '__', e.g.:
       molecules_container_t       → overrides/molecules_container_t.cc
       mmdb::Residue               → overrides/mmdb__Residue.cc
+    Non-conforming filenames are resolved via _OVERRIDE_ALIASES.
 
-    pdb_path: full path to the example PDB file to substitute for @PDB_PATH@.
-    Falls back to the default example.pdb when None.
+    pdb_path: full path to the example PDB to substitute for @PDB_PATH@.
+    mtz_path: full path to the example MTZ to substitute for @MTZ_PATH@.
+    Both fall back to the default test-data examples when None.
     """
-    stem = type_qname.replace("::", "__")
+    stem = _override_stem_for(type_qname)
     path = OVERRIDES_DIR / f"{stem}.cc"
     if not path.exists():
         return None
     resolved_pdb = pdb_path or str(_TEST_DATA_DIR / "example.pdb")
+    resolved_mtz = mtz_path or str(_TEST_DATA_DIR / "example.mtz")
     return (
         path.read_text()
         .replace("@TEST_DATA_DIR@", str(_TEST_DATA_DIR))
         .replace("@PDB_PATH@", resolved_pdb)
+        .replace("@MTZ_PATH@", resolved_mtz)
     )
+
+
+def _available_override_types() -> dict[str, str]:
+    """Map type-qname -> file stem for every override file currently present,
+    including the non-conforming aliases. The qname is reconstructed from the
+    filename ('__' -> '::'); aliases add the special cases on top.
+
+    A file reached via an alias (e.g. xmap.cc <- clipper::Xmap) is NOT also
+    exposed under its bare filename qname, so it can't be injected twice or
+    spuriously match an identifier that happens to share the stem."""
+    alias_stems = set(_OVERRIDE_ALIASES.values())
+    out: dict[str, str] = {}
+    for p in OVERRIDES_DIR.glob("*.cc"):
+        if p.stem in alias_stems:
+            continue  # exposed via its proper alias qname instead
+        out[p.stem.replace("__", "::")] = p.stem
+    out.update(_OVERRIDE_ALIASES)
+    return out
+
+
+def construction_overrides_for_function(
+    fn_source: str,
+    *,
+    exclude_qname: str | None = None,
+    pdb_path: str | None = None,
+    mtz_path: str | None = None,
+) -> list[tuple[str, str]]:
+    """Curated construction recipes for hard *dependency* types a function
+    references in its signature or body — e.g. a `coot::protein_geometry&`
+    argument, a `coot::restraints_container_t` it builds, or a
+    `clipper::Xmap` it fills. These are the types the eval shows agents
+    rediscovering from scratch (missing_type_info / bad_construction).
+
+    Driven off the override files that actually exist, so dropping a new
+    overrides/*.cc auto-wires it. Returns (type_qname, override_text) pairs,
+    skipping `exclude_qname` (normally the containing class, which is injected
+    separately) and any type the function does not reference."""
+    source = fn_source or ""
+    out: list[tuple[str, str]] = []
+    seen_stems: set[str] = set()
+    for qname, stem in sorted(_available_override_types().items()):
+        if exclude_qname and qname == exclude_qname:
+            continue
+        if stem in seen_stems:
+            continue  # same file already injected under another qname
+        short = _short_name(qname)
+        referenced = (qname in source) or bool(
+            re.search(rf"\b{re.escape(short)}\b", source)
+        )
+        if not referenced:
+            continue
+        text = _load_override(qname, pdb_path=pdb_path, mtz_path=mtz_path)
+        if text:
+            out.append((qname, text))
+            seen_stems.add(stem)
+    return out
 
 
 def _render_type(
@@ -488,6 +563,16 @@ def build_oracle_prompt(
                     if ctor_caller["comment"]:
                         parts.append(f"_{ctor_caller['comment']}_")
                     parts.append(f"```cpp\n{ctor_caller['source_code'].rstrip()}\n```")
+
+    # Curated construction recipes for hard dependency types the function
+    # references (e.g. a protein_geometry& argument, a clipper::Xmap it fills)
+    # beyond the containing class — the recipes agents otherwise rediscover.
+    for dep_qname, dep_text in construction_overrides_for_function(
+        fn["source_code"] or "",
+        exclude_qname=containing_class["qualified_name"] if containing_class else None,
+        pdb_path=str(_TEST_DATA_DIR / pdb_file),
+    ):
+        section(f"`{dep_qname}` construction (curated)", dep_text)
 
     # Types used in the function body
     if used_types:

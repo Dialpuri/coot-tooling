@@ -41,6 +41,39 @@ FAILURE_MODES: list[tuple[str, str]] = [
      "None of the above fit; describe in note."),
 ]
 
+# Taxonomy shown in the ran_out_of_turns reprompt — same list minus that label.
+_FOLLOWUP_MODES: list[tuple[str, str]] = [
+    (label, desc) for label, desc in FAILURE_MODES
+    if label != "ran_out_of_turns"
+]
+
+_FOLLOWUP_PROMPT = """\
+Your classification of `ran_out_of_turns` describes a symptom, not a root cause. \
+The agent was given a generous turn budget; something specific kept it looping \
+without making progress.
+
+Look again at what the agent was actually stuck on during those final turns: \
+was it a compile error it couldn't resolve? Wrong API usage it kept retrying? \
+A type it couldn't locate? Degenerate / repetitive reasoning?
+
+Pick the single best label from the taxonomy below (ran_out_of_turns is not \
+available) and explain *what specific blocker* caused the agent to exhaust its \
+budget. Quote concrete evidence from the trace.
+
+## Revised taxonomy (ran_out_of_turns excluded)
+
+{taxonomy}
+
+Respond ONLY with a single JSON object:
+
+{{
+  "failure_mode": "<one of the revised taxonomy labels>",
+  "confidence": "low" | "medium" | "high",
+  "note": "<1-3 sentences with concrete evidence of the underlying blocker>",
+  "evidence_excerpt": "<one short verbatim quote from the trace, <=200 chars>"
+}}
+"""
+
 
 SYSTEM_PROMPT = """\
 You are a failure-mode analyst for an LLM agent pipeline that ports C++ \
@@ -150,13 +183,27 @@ def evaluate_trace(*, qname: str, stage: str, detection_reason: str,
     trace, truncated = _truncate_trace(raw)
     user_prompt = _build_user_prompt(qname, stage, detection_reason, trace, truncated)
 
-    messages = [
+    messages: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
     resp = chat(messages, model=model, tools=[])
     content = (resp.get("message") or {}).get("content", "") or ""
     parsed = _extract_json(content) or {}
+
+    if parsed.get("failure_mode") == "ran_out_of_turns":
+        taxonomy = "\n".join(
+            f"  - `{label}`: {desc}" for label, desc in _FOLLOWUP_MODES
+        )
+        followup = _FOLLOWUP_PROMPT.format(taxonomy=taxonomy)
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "user", "content": followup})
+        resp2 = chat(messages, model=model, tools=[])
+        content2 = (resp2.get("message") or {}).get("content", "") or ""
+        parsed2 = _extract_json(content2) or {}
+        if parsed2.get("failure_mode") and parsed2["failure_mode"] != "ran_out_of_turns":
+            parsed = parsed2
+            content = content2
 
     return EvaluationResult(
         qname=qname,
