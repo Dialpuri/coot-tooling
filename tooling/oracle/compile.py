@@ -1,10 +1,42 @@
 """Compilation helpers for oracle.cc programs."""
 from __future__ import annotations
 
+import functools
+import os
 import subprocess
 from pathlib import Path
 
 from ..db import PROJECT_ROOT
+
+# CCP4 setup script — sourcing it exports CLIBD/CLIBD_MON/SYMINFO/etc. that
+# coot needs at *runtime* (protein_geometry::init_standard, map symmetry, ...).
+CCP4_SETUP = "/public/xtal/ccp4/ccp4-64/ccp4-9/bin/ccp4.setup-sh"
+
+
+@functools.lru_cache(maxsize=1)
+def ccp4_env() -> dict[str, str]:
+    """Return ``os.environ`` augmented with the variables CCP4's setup script
+    exports. The script is sourced once in a clean shell and the resulting
+    environment cached. Falls back to a plain copy of ``os.environ`` if the
+    setup script is missing or fails, so callers can always pass ``env=`` safely.
+    """
+    env = dict(os.environ)
+    if not os.path.exists(CCP4_SETUP):
+        return env
+    try:
+        proc = subprocess.run(
+            ["sh", "-c", f". '{CCP4_SETUP}' >/dev/null 2>&1 && env -0"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return env
+    if proc.returncode != 0:
+        return env
+    for entry in proc.stdout.split("\0"):
+        key, sep, value = entry.partition("=")
+        if sep and key:
+            env[key] = value
+    return env
 
 # ── constants (mirrored from mmdb-refactor-ui/backend/config.py) ─────────────
 CXX            = "clang++"

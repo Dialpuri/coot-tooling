@@ -82,6 +82,14 @@ _PATTERNS: list[tuple[str, str]] = [
      "subchain is gemmi's polymer/entity label (e.g. \"Axp\"), not the chain "
      "ID. Compare against the parent `Chain::name` instead (carry it via a "
      "`gemmi::CRA` or alongside the Residue*)."),
+    # The old GCC ABI define belongs in oracle/test stages (MMDB linkage) but
+    # must never appear in gemmi code — gemmi is compiled with the new ABI and
+    # the mismatch causes silent linker failures on any std::string parameter.
+    (r"#\s*define\s+_GLIBCXX_USE_CXX11_ABI\s+0",
+     "#define _GLIBCXX_USE_CXX11_ABI 0 must NOT appear in gemmi-stage files. "
+     "gemmi and libgemmi_cpp are compiled with the new (default) C++11 ABI; "
+     "forcing ABI 0 causes link-time 'undefined reference' errors on any "
+     "function whose signature contains std::string. Remove this line entirely."),
     # ── batch-mined 2026-05-21: header-verified, 0 false positives across the
     #    329 passing ports in generated-tests/. Each fired in the compile-fail
     #    corpus; replacements checked against ~/gemmi/include/gemmi.

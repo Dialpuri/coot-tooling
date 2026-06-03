@@ -173,33 +173,90 @@ def print_report(results: list[FunctionResult], stages: list[str], failures_only
 
 
 
-def _sanitize(qname: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9]", "_", qname).strip("_")
+_MMDB_KINDS = "('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR', 'FUNCTION_TEMPLATE', 'FUNCTION_DECL')"
+
+
+def _coot_connected_mmdb_qnames(conn) -> set[str]:
+    """Return qualified names of every MMDB-using function that has a call-graph
+    path to or from any coot:: function.
+
+    Two directions are unioned:
+    - Forward: coot:: functions + their transitive MMDB callees
+      (functions that coot:: depends on and that also need porting)
+    - Backward: non-coot:: functions that transitively call into coot::
+      (e.g. molecules_container_t, Bond_lines_container)
+    Functions with no path to/from coot:: in either direction are excluded.
+    """
+    forward = set(r[0] for r in conn.execute(f"""
+        WITH RECURSIVE callees(qname) AS (
+            SELECT DISTINCT qualified_name FROM functions
+             WHERE qualified_name LIKE 'coot::%'
+            UNION
+            SELECT DISTINCT c.callee_qualified_name
+              FROM callees cc
+              JOIN functions f ON f.qualified_name = cc.qname
+              JOIN calls c ON c.caller_id = f.id
+        )
+        SELECT DISTINCT cc.qname
+          FROM callees cc
+          JOIN functions f ON f.qualified_name = cc.qname
+          JOIN uses_type u ON u.function_id = f.id
+         WHERE f.kind IN {_MMDB_KINDS}
+           AND u.type_qualified_name LIKE 'mmdb::%'
+    """).fetchall())
+
+    backward = set(r[0] for r in conn.execute(f"""
+        WITH RECURSIVE callers(qname) AS (
+            SELECT DISTINCT qualified_name FROM functions
+             WHERE qualified_name LIKE 'coot::%'
+            UNION
+            SELECT DISTINCT f.qualified_name
+              FROM callers cc
+              JOIN calls c ON c.callee_qualified_name = cc.qname
+              JOIN functions f ON f.id = c.caller_id
+        )
+        SELECT DISTINCT cc.qname
+          FROM callers cc
+          JOIN functions f ON f.qualified_name = cc.qname
+          JOIN uses_type u ON u.function_id = f.id
+         WHERE f.kind IN {_MMDB_KINDS}
+           AND u.type_qualified_name LIKE 'mmdb::%'
+           AND f.qualified_name NOT LIKE 'coot::%'
+    """).fetchall())
+
+    return forward | backward
 
 
 def db_coverage(results: list[FunctionResult]) -> dict:
-    """Return counts of total MMDB functions in the DB vs attempted vs stage-complete."""
+    """Return counts of total MMDB functions in the DB vs attempted vs stage-complete.
+
+    The denominator (total_mmdb) counts only functions with a call-graph path
+    to or from coot:: — excluding the ~119 functions that are completely
+    isolated from the coot namespace.
+    """
+    from tooling.oracle.generate import find_function_dirs
+
     conn = _db.connect()
-    rows = conn.execute("""
-        SELECT DISTINCT f.qualified_name
-        FROM functions f
-        JOIN uses_type u ON u.function_id = f.id
-        WHERE f.kind IN ('CXX_METHOD', 'CONSTRUCTOR', 'DESTRUCTOR',
-                         'FUNCTION_TEMPLATE', 'FUNCTION_DECL')
-          AND u.type_qualified_name LIKE 'mmdb::%'
-    """).fetchall()
+    relevant_qnames = _coot_connected_mmdb_qnames(conn)
     conn.close()
 
-    total_mmdb = len(rows)
+    total_mmdb = len(relevant_qnames)
     result_map = {r.name: r for r in results}
-    sanitized = [_sanitize(row[0]) for row in rows]
-    attempted = sum(1 for s in sanitized if s in result_map)
+
+    # For each relevant qname, find all matching output dirs (handles overload hash suffixes).
+    all_matching: list[FunctionResult] = []
+    for qname in relevant_qnames:
+        for d in find_function_dirs(qname, OUT_ROOT):
+            if d.name in result_map:
+                all_matching.append(result_map[d.name])
+
+    attempted = len(all_matching)
 
     stage_complete: dict[str, int] = {}
     for stage in STAGES:
         stage_complete[stage] = sum(
-            1 for s in sanitized
-            if result_map.get(s) and result_map[s].stage_status.get(stage) == "pass"
+            1 for r in all_matching
+            if r.stage_status.get(stage) == "pass"
         )
 
     return {
@@ -261,7 +318,7 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
     # Title + subtitle
     fig.text(0.5, 0.98, "MMDB → Gemmi Refactor", ha="center", va="top",
              fontsize=17, fontweight="bold", color=TEXT)
-    fig.text(0.5, 0.93, f"{total} functions attempted  ·  {total_mmdb} total MMDB functions in DB",
+    fig.text(0.5, 0.93, f"{total} functions attempted  ·  {total_mmdb} MMDB functions connected to coot::",
              ha="center", va="top", fontsize=10, color=SUBTEXT)
 
     gs = fig.add_gridspec(1, 3, left=0.06, right=0.97, top=0.84, bottom=0.12,

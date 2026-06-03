@@ -470,6 +470,19 @@ def _maybe_evaluate(out_dir: Path, model: str, log) -> None:
             log(f"evaluate: skipped — {e}")
 
 
+def _archive_output_dir(out_dir: Path, log) -> None:
+    """Move all current contents of out_dir into a .old-<timestamp> subfolder."""
+    import shutil
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive = out_dir / f".old-{stamp}"
+    archive.mkdir(exist_ok=True)
+    for child in out_dir.iterdir():
+        if child.name.startswith(".old-"):
+            continue
+        shutil.move(str(child), str(archive / child.name))
+    log(f"retry-failed: archived previous output to {archive.name}/")
+
+
 def _process(
     qname: str,
     sig_hash: str | None,
@@ -482,6 +495,7 @@ def _process(
     overwrite: bool = False,
     commit: bool = False,
     evaluate: bool = True,
+    retry_failed: bool = False,
 ) -> Result:
     r = Result(qname, sig_hash)
     out_dir = OUT_ROOT / sanitize_name(qname, sig_hash)
@@ -513,9 +527,14 @@ def _process(
         _clear_worker_state()
         return r
 
+    # --retry-failed: archive the current output folder contents then re-run all stages.
+    if retry_failed and out_dir.exists():
+        _archive_output_dir(out_dir, log)
+    eff_overwrite = overwrite or retry_failed
+
     # ── oracle phase ──────────────────────────────────────────────────────────
     oracle_result_json = out_dir / "oracle" / "result.json"
-    if not overwrite and oracle_result_json.exists():
+    if not eff_overwrite and oracle_result_json.exists():
         log("oracle: skipped (result.json exists)")
         r.oracle_ok = True
     elif skip_oracle and oracle_cc.exists():
@@ -563,7 +582,7 @@ def _process(
         r.oracle_ok = True
 
     # ── test phase ────────────────────────────────────────────────────────────
-    if not overwrite and _test_is_passing(out_dir):
+    if not eff_overwrite and _test_is_passing(out_dir):
         log("test: skipped (already passing)")
         r.test_ok = True
     else:
@@ -638,7 +657,8 @@ def _run_in_parallel(
 
     if args.backend == "openai":
         openai_hosts = OPENAI_HOSTS
-        ollama_hosts = [OLLAMA_HOSTS[0]]  # dummy, won't be used
+        # Fill one dummy slot per worker so the queue never blocks.
+        ollama_hosts = [OLLAMA_HOSTS[0]] * args.workers
     else:
         openai_hosts = []
         ollama_hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
@@ -647,9 +667,16 @@ def _run_in_parallel(
     for h in ollama_hosts:
         ollama_host_queue.put(h)
 
-    openai_host_queue: queue.Queue[str] = queue.Queue()
-    for h in openai_hosts:
-        openai_host_queue.put(h)
+    # OpenAI hosts: use a queue only when there are multiple hosts (Ollama-replica
+    # sharding). With a single vLLM endpoint the queue would serialise all workers
+    # on the one slot — instead every worker just reads the host directly.
+    openai_host_queue: queue.Queue[str] | None = None
+    if len(openai_hosts) > 1:
+        openai_host_queue = queue.Queue()
+        for h in openai_hosts:
+            openai_host_queue.put(h)
+    elif openai_hosts:
+        set_openai_host(openai_hosts[0])
 
     def _process_with_host(entry: tuple[str, str | None]) -> Result:
         qname, sig_hash = entry
@@ -657,7 +684,7 @@ def _run_in_parallel(
         openai_host = None
         try:
             set_host(ollama_host)
-            if openai_hosts:
+            if openai_host_queue is not None:
                 openai_host = openai_host_queue.get()
                 set_openai_host(openai_host)
             return _run_with_deadline(
@@ -665,7 +692,8 @@ def _run_in_parallel(
                 (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
                  with_gemmi, args.overwrite, commit,
-                 getattr(args, "evaluate", True)),
+                 getattr(args, "evaluate", True),
+                 getattr(args, "retry_failed", False)),
                 FUNCTION_DEADLINE_SECONDS,
                 qname, sig_hash,
             )
@@ -713,7 +741,8 @@ def _run_topo_waves(
 
     if args.backend == "openai":
         openai_hosts = OPENAI_HOSTS
-        ollama_hosts = [OLLAMA_HOSTS[0]]  # dummy, won't be used
+        # Fill one dummy slot per worker so the queue never blocks.
+        ollama_hosts = [OLLAMA_HOSTS[0]] * args.workers
     else:
         openai_hosts = []
         ollama_hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
@@ -722,9 +751,16 @@ def _run_topo_waves(
     for h in ollama_hosts:
         ollama_host_queue.put(h)
 
-    openai_host_queue: queue.Queue[str] = queue.Queue()
-    for h in openai_hosts:
-        openai_host_queue.put(h)
+    # OpenAI hosts: use a queue only when there are multiple hosts (Ollama-replica
+    # sharding). With a single vLLM endpoint the queue would serialise all workers
+    # on the one slot — instead every worker just reads the host directly.
+    openai_host_queue: queue.Queue[str] | None = None
+    if len(openai_hosts) > 1:
+        openai_host_queue = queue.Queue()
+        for h in openai_hosts:
+            openai_host_queue.put(h)
+    elif openai_hosts:
+        set_openai_host(openai_hosts[0])
 
     def _process_with_host(entry: tuple[str, str | None]) -> Result:
         qname, sig_hash = entry
@@ -732,7 +768,7 @@ def _run_topo_waves(
         openai_host = None
         try:
             set_host(ollama_host)
-            if openai_hosts:
+            if openai_host_queue is not None:
                 openai_host = openai_host_queue.get()
                 set_openai_host(openai_host)
             return _run_with_deadline(
@@ -740,7 +776,8 @@ def _run_topo_waves(
                 (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
                  with_gemmi, args.overwrite, commit,
-                 getattr(args, "evaluate", True)),
+                 getattr(args, "evaluate", True),
+                 getattr(args, "retry_failed", False)),
                 FUNCTION_DEADLINE_SECONDS,
                 qname, sig_hash,
             )
@@ -907,6 +944,11 @@ def main() -> None:
                         help="Parallel workers (default 1)")
     parser.add_argument("--overwrite",     action="store_true",
                         help="Re-run all stages even if gemmi/function.hh + gemmi/test.cc already exist")
+    parser.add_argument("--retry-failed",  action="store_true", dest="retry_failed",
+                        help="Re-run all stages for any function that is not fully complete "
+                             "(i.e. has a failed or missing stage). Functions that are already "
+                             "complete and passing are still skipped. Unlike --overwrite, this "
+                             "never re-runs functions that already pass.")
     parser.add_argument("--commit",        action="store_true",
                         help="Commit successful gemmi ports into the coot source tree")
     parser.add_argument("--no-evaluate",   action="store_false", dest="evaluate", default=True,
@@ -989,7 +1031,7 @@ def main() -> None:
                 (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
                  args.with_gemmi, args.overwrite, args.commit,
-                 args.evaluate),
+                 args.evaluate, args.retry_failed),
                 FUNCTION_DEADLINE_SECONDS,
                 qname, sig_hash,
             )
@@ -1049,6 +1091,9 @@ def main_file() -> None:
                         help="Parallel workers (default 1)")
     parser.add_argument("--overwrite",     action="store_true",
                         help="Re-run all stages even if gemmi/function.hh + gemmi/test.cc already exist")
+    parser.add_argument("--retry-failed",  action="store_true", dest="retry_failed",
+                        help="Re-run all stages for any function that is not fully complete. "
+                             "Functions that already pass are still skipped.")
     parser.add_argument("--commit",        action="store_true",
                         help="Commit successful gemmi ports into the coot source tree")
     parser.add_argument("--no-evaluate",   action="store_false", dest="evaluate", default=True,
@@ -1132,7 +1177,7 @@ def main_file() -> None:
                 (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
                  with_gemmi, args.overwrite, False,
-                 args.evaluate),
+                 args.evaluate, args.retry_failed),
                 FUNCTION_DEADLINE_SECONDS,
                 qname, sig_hash,
             )

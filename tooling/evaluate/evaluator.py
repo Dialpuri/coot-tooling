@@ -9,7 +9,7 @@ from pathlib import Path
 from ..llm import chat
 
 
-DEFAULT_MODEL = "qwen3.6"
+DEFAULT_MODEL = "qwen3.6:27b"
 
 # Fixed failure taxonomy. The evaluator must pick exactly one of these
 # labels; free-form detail goes in `note`. Keep this list short and

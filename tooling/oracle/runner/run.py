@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from .results import OracleResult, parse_output, save_result
+from ..compile import ccp4_env
 
 
 RUN_TIMEOUT_SECONDS = 20
@@ -25,7 +26,7 @@ def run_binary(binary: Path, args: list[str] | None = None, cwd: Path | None = N
     for attempt in range(1, attempts + 1):
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            cwd=cwd_str, start_new_session=True,
+            cwd=cwd_str, start_new_session=True, env=ccp4_env(),
         )
         try:
             stdout, stderr = proc.communicate(timeout=RUN_TIMEOUT_SECONDS)

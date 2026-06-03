@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ..oracle.compile import (
     CXX, GEMMI_INCLUDE, BOOST_INCLUDE, GSL_INCLUDE, GLM_INCLUDE,
-    CLIPPER_INCLUDE, AUTOBUILD_LIB, RDKIT_INCLUDE,
+    CLIPPER_INCLUDE, AUTOBUILD_LIB, RDKIT_INCLUDE, COOT_BUILD_DIR, ccp4_env,
 )
 
 CLIPPER_LIBS = [
@@ -64,7 +64,9 @@ def make_gemmi_compile_cmd(
         f'{includes} -pthread '
         f'-Wl,-rpath,{GEMMI_LIB_DIR} '
         f'-Wl,-rpath,{AUTOBUILD_LIB} '
+        f'-Wl,-rpath,{COOT_BUILD_DIR} '
         f'-L "{GEMMI_LIB_DIR}" -l{GEMMI_LIB_NAME} '
+        f'-L "{COOT_BUILD_DIR}" -lcootapi '
         f'-L "{AUTOBUILD_LIB}" {clipper_libs} {rdkit_libs} '
         f'-L "{GTEST_LIB_DIR}" -lgtest -lgtest_main -lm -no-pie'
     )
@@ -96,7 +98,7 @@ def run_gemmi_test_binary(test_bin: Path, attempts: int = 2) -> tuple[bool, str]
     for attempt in range(1, attempts + 1):
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            cwd=cwd, start_new_session=True,
+            cwd=cwd, start_new_session=True, env=ccp4_env(),
         )
         try:
             stdout, stderr = proc.communicate(timeout=20)

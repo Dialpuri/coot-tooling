@@ -9,7 +9,7 @@ from ..oracle.compile import (
     AUTOBUILD_LIB, COOT_BUILD_DIR,
     GEMMI_INCLUDE, CLIPPER_INCLUDE, BOOST_INCLUDE,
     MMDB_INCLUDE, GSL_INCLUDE, PNG_INCLUDE, GLM_INCLUDE,
-    RDKIT_INCLUDE,
+    RDKIT_INCLUDE, ccp4_env,
 )
 from ..db import PROJECT_ROOT
 
@@ -72,7 +72,7 @@ def _spawn_and_wait(cmd: list[str], cwd: str, timeout: int) -> tuple[int | None,
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        cwd=cwd, start_new_session=True,
+        cwd=cwd, start_new_session=True, env=ccp4_env(),
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
