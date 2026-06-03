@@ -1793,15 +1793,25 @@ def _tool_find_symbol(symbol: str) -> str:
 
 
 def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, callable]:
-    """Return (compile_handler, run_handler, compiled_ok) for the oracle agent loop.
+    """Return handlers + introspection callables for the oracle agent loop.
 
-    compiled_ok() returns True once at least one compile_oracle call has succeeded.
+    Returns (compile_handler, run_handler, read_handler, patch_handler,
+    compiled_ok, last_compiled_source).
+
+    compiled_ok() returns True once at least one compile has succeeded.
+    last_compiled_source() returns the exact source of the most recent
+    *successful* compile, regardless of whether it arrived via compile_oracle
+    or patch_oracle (both funnel through compile_handler). This is the single
+    source of truth for "code that actually compiled" — the agent loop must
+    not infer it from tool names, because a patch_oracle fix compiles real
+    code without ever calling compile_oracle.
     """
     from .compile import write_compile_script
 
-    attempts    = [0]
-    last_binary = [None]
-    draft_seq   = [0]
+    attempts      = [0]
+    last_binary   = [None]
+    last_good_src = [None]   # source of the most recent successful compile
+    draft_seq     = [0]
 
     def _save_draft(filename: str, content: str, kind: str) -> None:
         """Snapshot the current file under oracle/drafts/NNN_<kind>_<filename>.
@@ -1858,6 +1868,7 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
             output = "\n".join(lines[:100]) + f"\n... ({len(lines) - 100} more lines)"
         if proc.returncode == 0:
             last_binary[0] = oracle_bin
+            last_good_src[0] = code
             return f"Compilation succeeded (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS})."
         last_binary[0] = None
         msg = f"Compilation FAILED (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS}):\n{output}"
@@ -1942,7 +1953,11 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
     def compiled_ok() -> bool:
         return last_binary[0] is not None
 
-    return compile_handler, run_handler, read_handler, patch_handler, compiled_ok
+    def last_compiled_source() -> str | None:
+        return last_good_src[0]
+
+    return (compile_handler, run_handler, read_handler, patch_handler,
+            compiled_ok, last_compiled_source)
 
 
 def _dispatch(
@@ -2130,9 +2145,10 @@ def generate_with_agent(
     trace_lines.append(f"=== AGENT TRACE: {function_qname} ===\n")
     trace_lines.append(f"[user]\n{textwrap.indent(user_content, '  ')}\n")
 
-    compile_handler, run_handler, read_handler, patch_handler, compiled_ok = (
+    (compile_handler, run_handler, read_handler, patch_handler, compiled_ok,
+     last_compiled_source) = (
         _make_oracle_tool_handlers(oracle_out)
-        if oracle_out else (None, None, None, None, lambda: False)
+        if oracle_out else (None, None, None, None, lambda: False, lambda: None)
     )
 
     def dispatch(name: str, args: dict) -> str:
@@ -2173,7 +2189,6 @@ def generate_with_agent(
     tools = ORACLE_TOOLS if oracle_out else TOOLS
     oracle_code: str | None = None
     last_draft: list[str | None] = [None]    # any cpp draft we've ever seen (fallback)
-    last_compiled_draft: list[str | None] = [None]  # last code that actually compiled
     call_counts: dict[str, int] = {}         # repeat-call detection
     tool_cache: dict[str, str] = {}          # memoize read-only lookups within a session
     REPEAT_LIMIT = 3
@@ -2308,15 +2323,10 @@ def generate_with_agent(
                 else:
                     guard_state["empty_streak"] = 0
 
-            # Capture the draft that actually compiled. We can only trust a
-            # draft for rescue / downstream use once compile_oracle has
-            # returned "Compilation succeeded" on it; speculative drafts
-            # poison every later stage because the broken code propagates
-            # into oracle.cc, test.cc, then function.hh.
-            if (name == "compile_oracle"
-                    and isinstance(args.get("code"), str)
-                    and "Compilation succeeded" in result):
-                last_compiled_draft[0] = args["code"]
+            # The draft that actually compiled is tracked by the handler
+            # itself (`last_compiled_source`), since both compile_oracle and
+            # patch_oracle funnel through compile_handler — inferring it from
+            # the tool name here would miss patch_oracle fixes entirely.
 
             result_lines = result.splitlines()
             if len(result_lines) > 150:
@@ -2477,8 +2487,9 @@ def generate_with_agent(
                 trace_lines.append("[agent] Extension exhausted without final answer.\n")
 
     # ── Final selection: only ever ship a draft that actually compiled ──────
-    # `last_compiled_draft` is populated by `_run_tool_calls` only when
-    # `compile_oracle` returned success on the supplied code. Any other
+    # `last_compiled_source()` returns the exact source of the most recent
+    # successful compile, whether it arrived via compile_oracle OR via a
+    # patch_oracle fix (both funnel through compile_handler). Any other
     # draft (the agent's final message, the last attempted compile, a
     # speculative one-shot rescue) might not even parse and would poison
     # the test + gemmi stages that consume oracle.cc as ground truth — the
@@ -2488,14 +2499,15 @@ def generate_with_agent(
     def _is_usable(code: str | None) -> bool:
         return bool(code and len(code) > 100 and "#include" in code)
 
-    if _is_usable(last_compiled_draft[0]):
+    compiled_src = last_compiled_source()
+    if _is_usable(compiled_src):
         if (_is_usable(oracle_code)
-                and oracle_code.strip() != last_compiled_draft[0].strip()):
+                and oracle_code.strip() != compiled_src.strip()):
             trace_lines.append(
                 "[final] Final assistant message differs from last compiled "
                 "draft — trusting the draft that actually compiled.\n"
             )
-        oracle_code = last_compiled_draft[0]
+        oracle_code = compiled_src
     else:
         if _is_usable(oracle_code):
             trace_lines.append(

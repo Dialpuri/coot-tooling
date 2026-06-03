@@ -37,13 +37,17 @@ def make_test_compile_cmd(test_cc: Path, output_bin: Path) -> str:
         "MolTransforms", "RDInchiLib",
     ])
 
+    # -lgsl depends on -lgslcblas; needed by gradient/derivative functions.
+    gsl_libraries = "-lgsl -lgslcblas"
+
     return (
         f'{CXX} -std=c++20 -fno-access-control "{test_cc.absolute()}" -o "{output_bin.absolute()}" '
         f'{includes} '
         f'-Wl,-rpath,{AUTOBUILD_LIB} '
         f'-Wl,-rpath,{COOT_BUILD_DIR} '
         f'-L "{COOT_BUILD_DIR}" -lcootapi '
-        f'-L "{AUTOBUILD_LIB}" {clipper_libraries} {rdkit_libraries} -l{MMDB_API_NAME} -lstdc++ '
+        f'-L "{AUTOBUILD_LIB}" {clipper_libraries} {rdkit_libraries} -l{MMDB_API_NAME} '
+        f'{gsl_libraries} -lstdc++ '
         f'-L "{GTEST_LIB_DIR}" -lgtest -lgtest_main -lm -no-pie'
     )
 

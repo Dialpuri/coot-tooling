@@ -67,7 +67,9 @@ def make_compile_cmd(oracle_cc: Path, output_bin: Path) -> str:
         "RDStreams", "RDGeometryLib", "SubstructMatch", "Depictor",
         "MolTransforms", "RDInchiLib",
     ])
-    # gsl_libraries = "-lgsl -lgslcblas"
+    # GSL is pulled in by gradient/derivative functions (crankshaft, df_planes,
+    # restraints refinement). -lgsl depends on -lgslcblas, so keep this order.
+    gsl_libraries = "-lgsl -lgslcblas"
 
     return (
         f'{CXX} -std=c++20 -fno-access-control "{oracle_cc}" -o "{output_bin}" '
@@ -75,7 +77,8 @@ def make_compile_cmd(oracle_cc: Path, output_bin: Path) -> str:
         f'-Wl,-rpath,{AUTOBUILD_LIB} '
         f'-Wl,-rpath,{COOT_BUILD_DIR} '
         f'-L "{COOT_BUILD_DIR}" -lcootapi '
-        f'-L "{AUTOBUILD_LIB}" {clipper_libraries} {rdkit_libraries} -lmmdb2 -lstdc++'
+        f'-L "{AUTOBUILD_LIB}" {clipper_libraries} {rdkit_libraries} -lmmdb2 '
+        f'{gsl_libraries} -lstdc++'
     )
 
 
