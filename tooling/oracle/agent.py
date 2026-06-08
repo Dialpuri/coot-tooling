@@ -34,6 +34,7 @@ from ..db import (
     get_containing_class,
 )
 from .render import INCLUDE_ROOTS, _to_include, _load_override, construction_overrides_for_function, MMDB_MANAGER_SNIPPET, caller_class_fields
+from .advisories import code_advisories
 from ..llm import chat as _chat
 
 
@@ -919,6 +920,46 @@ def _has_compile_intent(thinking: str) -> bool:
         thinking,
         re.IGNORECASE,
     ))
+
+
+# GCC/Clang both print actionable name-resolution fixes the model routinely
+# ignores: `'FOO' was not declared ...; did you mean 'coot::FOO'?` and
+# `note: suggested alternative: 'coot::FOO'`. These sit in the diagnostic
+# stream but get lost amid template noise — surfacing them as an explicit
+# directive is the single biggest lever on the namespace-prefix cluster of
+# compile_error_unfixed failures (the exemplar: COLOUR_BY_CHAIN needing a
+# `coot::` qualifier). Purely additive: it only echoes the compiler's own
+# suggestion, so it can never reject otherwise-valid code.
+_DID_YOU_MEAN_RE = re.compile(r"did you mean ['‘]([^'’\n]+)['’]\s*\?")
+_SUGGESTED_ALT_RE = re.compile(r"suggested alternative[s]?:\s*['‘]([^'’\n]+)['’]")
+
+
+def _compiler_suggestion_directive(output: str) -> str | None:
+    """Extract `did you mean 'X'` / `suggested alternative: 'X'` hints from a
+    compiler log and render an explicit fix directive. Returns None if the
+    compiler offered no name-resolution suggestion.
+    """
+    # GCC occasionally suggests a bare keyword (e.g. `if`, `do`) as a fuzzy
+    # match — pure noise that would mislead more than help. Drop those.
+    _NOISE = {"if", "do", "for", "while", "int", "char", "void", "new", "delete"}
+    suggestions: list[str] = []
+    seen: set[str] = set()
+    for rx in (_DID_YOU_MEAN_RE, _SUGGESTED_ALT_RE):
+        for sym in rx.findall(output):
+            sym = sym.strip()
+            if sym and sym not in seen and sym not in _NOISE:
+                seen.add(sym)
+                suggestions.append(sym)
+    if not suggestions:
+        return None
+    quoted = ", ".join(f"`{s}`" for s in suggestions[:6])
+    return (
+        "DIRECTIVE: the compiler told you exactly how to fix an unresolved "
+        f"name — apply its suggestion(s): {quoted}. Most often this is a "
+        "missing namespace qualifier (e.g. an enum constant or free function "
+        "that lives in `coot::`). Replace the unqualified name with the "
+        "suggested spelling and recompile before changing anything else."
+    )
 
 
 # ── tool implementations ──────────────────────────────────────────────────────
@@ -1872,6 +1913,12 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
             return f"Compilation succeeded (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS})."
         last_binary[0] = None
         msg = f"Compilation FAILED (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS}):\n{output}"
+        suggestion = _compiler_suggestion_directive(output)
+        if suggestion:
+            msg = (
+                f"Compilation FAILED (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS}):\n"
+                f"{suggestion}\n\n{output}"
+            )
         if (
             "no type named 'molecules_container_t' in namespace 'coot'" in output
             or "coot::molecules_container_t" in output
@@ -1919,6 +1966,18 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
                 "set up those inputs, add OUTPUT prints that capture the side "
                 "effects, and call compile_oracle again."
             )
+        # Soft advisory on any failure signal (crash, no output, or an obvious
+        # empty-dictionary sentinel): an uninitialised protein_geometry is a
+        # frequent silent cause. Never blocks — just points at a likely fix.
+        suspicious = (
+            proc.returncode != 0
+            or not has_output_lines
+            or "XXXXXX" in output
+            or "Cache is empty" in output
+        )
+        if suspicious:
+            for advisory in code_advisories(last_good_src[0] or ""):
+                result += "\n\n" + advisory
         return result
 
     def read_handler() -> str:

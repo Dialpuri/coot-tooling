@@ -30,10 +30,12 @@ from ..oracle.agent import (
     _has_compile_intent,
     loop_guard_intercept,
     _is_empty_lookup_result,
+    _compiler_suggestion_directive,
     LOOKUP_TOOLS_FOR_CAP,
     NUDGE_EVERY_N_TURNS,
     NO_COMPILE_AFTER,
 )
+from ..oracle.advisories import code_advisories
 
 # Format-reminder nudge (injected every NUDGE_EVERY_N_TURNS turns) — keeps
 # the output-format spec near the end of the context where attention is
@@ -1425,6 +1427,9 @@ def _make_tool_handlers(
 
         compile_log = gemmi_subdir / "compile.log"
         compile_log.write_text(output)
+        # Pull name-resolution hints from the FULL log before truncation, so a
+        # `did you mean 'coot::X'?` note buried in the middle isn't elided.
+        suggestion = _compiler_suggestion_directive(output)
         output = _summarise_compile_output(output)
         if success:
             last_binary[0] = test_bin
@@ -1434,9 +1439,15 @@ def _make_tool_handlers(
             if len(run_lines) > 100:
                 run_out = "\n".join(run_lines[:100]) + f"\n... ({len(run_lines) - 100} more lines)"
             status = "All tests PASSED." if run_ok else "Some tests FAILED — fix your FUNCTION IMPLEMENTATION (do NOT modify the EXPECT_*/ASSERT_* assertions) and recompile."
+            tail = ""
+            if not run_ok:
+                combined = "\n".join(
+                    [test_cc or "", function_cc or "", function_hh or ""]
+                )
+                tail = "".join("\n\n" + a for a in code_advisories(combined))
             return (
                 f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}).\n"
-                f"{status}\n{run_out}"
+                f"{status}\n{run_out}{tail}"
             )
         last_binary[0] = None
         last_error_log[0] = compile_log
@@ -1445,6 +1456,8 @@ def _make_tool_handlers(
         )
         prefix = (f"Compilation FAILED (attempt {attempts[0]}/"
                   f"{MAX_COMPILE_ATTEMPTS}):\n")
+        if suggestion:
+            prefix += suggestion + "\n\n"
         if directive:
             prefix += directive + "\n\n"
         return prefix + output

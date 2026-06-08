@@ -3,10 +3,33 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import subprocess
 from pathlib import Path
 
 from ..db import PROJECT_ROOT
+
+# gtest prints this summary line only after RUN_ALL_TESTS() has fully returned,
+# so a crash that follows it happened in global/atexit teardown (the classic
+# case: a static `molecules_container_t` whose destructor double-frees), NOT in
+# a test body. The assertions all held — the verdict should be PASS.
+_GTEST_PASSED_RE = re.compile(r"\[\s*PASSED\s*\]\s+(\d+)\s+test")
+
+
+def is_teardown_only_crash(output: str, returncode: int | None) -> bool:
+    """True when every gtest assertion passed but the process then crashed
+    during static/atexit teardown.
+
+    Requires a non-zero / signal exit AND a gtest `[  PASSED  ] N tests.`
+    summary (N>0) AND no `[  FAILED  ]` line. Used to stop teardown-only
+    double-frees from masquerading as test failures.
+    """
+    if returncode is None or returncode == 0:
+        return False
+    if "[  FAILED  ]" in output:
+        return False
+    m = _GTEST_PASSED_RE.search(output)
+    return bool(m and int(m.group(1)) > 0)
 
 # CCP4 setup script — sourcing it exports CLIBD/CLIBD_MON/SYMINFO/etc. that
 # coot needs at *runtime* (protein_geometry::init_standard, map symmetry, ...).

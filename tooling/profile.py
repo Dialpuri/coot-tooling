@@ -488,9 +488,7 @@ def main() -> None:
                         help="only show failure details, skip per-function table")
     parser.add_argument("--csv", metavar="FILE", default=None,
                         help="also write results to a CSV file")
-    parser.add_argument("--graph", action="store_true",
-                        help="show a matplotlib progress chart")
-    parser.add_argument("--graph-out", metavar="FILE", default=None,
+    parser.add_argument("--graph", metavar="FILE", default=None,
                         help="save graph to FILE instead of displaying it (implies --graph)")
     parser.add_argument("--presentation", action="store_true",
                         help="transparent background and cleaner styling for slides")
@@ -507,8 +505,8 @@ def main() -> None:
     if args.csv:
         write_csv(results, stages, args.csv)
 
-    if args.graph or args.graph_out:
-        plot_graph(results, stages, args.graph_out, presentation=args.presentation)
+    if args.graph:
+        plot_graph(results, stages, args.graph, presentation=args.presentation)
 
 
 if __name__ == "__main__":

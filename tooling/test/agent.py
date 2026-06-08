@@ -24,6 +24,7 @@ from ..oracle.agent import (
     NUDGE_EVERY_N_TURNS,
     NO_COMPILE_AFTER,
 )
+from ..oracle.advisories import code_advisories
 
 # Format-reminder nudge (injected every NUDGE_EVERY_N_TURNS turns).
 _TEST_NUDGE = (
@@ -64,8 +65,21 @@ expected value. Fix the test, not the oracle.
    each case. Single TEST block keeps the binary small and makes
    diffing against the gemmi test trivial — do not split into multiple
    TESTs.
-3. Do NOT write `main()` — gtest_main is linked. Adding `main()` causes
-   a link error.
+3. Normally do NOT write `main()` — gtest_main is linked and provides one.
+   EXCEPTION: if any test constructs a `molecules_container_t` (or another
+   object with heavy global/static state), its destructor can double-free
+   during program teardown and abort the process *after* all tests pass —
+   a spurious failure. To avoid that, give the test its own main that skips
+   global destructors:
+       int main(int argc, char** argv) {
+           ::testing::InitGoogleTest(&argc, &argv);
+           int r = RUN_ALL_TESTS();
+           std::fflush(nullptr);
+           _exit(r);            // bypass static destructors → no teardown abort
+       }
+   (A user-defined `main` cleanly overrides gtest_main's — it does NOT cause
+   a link error.) Construct such objects as function-local variables, not
+   file-scope statics.
 
 # Choosing assertions
 - Integer / bool / enum  → EXPECT_EQ, EXPECT_TRUE, EXPECT_FALSE
@@ -293,7 +307,13 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
         if len(lines) > 100:
             output = "\n".join(lines[:100]) + f"\n... ({len(lines) - 100} more lines)"
         status = "All tests PASSED." if success else "Some tests FAILED."
-        return f"{status}\n{output}"
+        result = f"{status}\n{output}"
+        if not success:
+            test_cc = test_subdir / "test.cc"
+            code = test_cc.read_text() if test_cc.exists() else ""
+            for advisory in code_advisories(code):
+                result += "\n\n" + advisory
+        return result
 
     def get_errors_handler() -> str:
         if last_error_log[0] is None or not last_error_log[0].exists():

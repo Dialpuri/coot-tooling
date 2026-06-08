@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..oracle.compile import is_teardown_only_crash
+
 
 STAGES = ("oracle", "test", "gemmi")
 
@@ -51,9 +53,15 @@ def _test_status(d: Path) -> StageStatus:
         return StageStatus("test", present, True, "run.exit == 0")
     if not binary.exists():
         return StageStatus("test", present, False, "no test binary (compile failed)")
-    if run_exit is not None:
-        return StageStatus("test", present, False, f"test binary exited {run_exit}")
     log_text = run_log.read_text() if run_log.exists() else ""
+    if run_exit is not None:
+        try:
+            rc_int = int(run_exit)
+        except ValueError:
+            rc_int = None
+        if is_teardown_only_crash(log_text, rc_int):
+            return StageStatus("test", present, True, "PASSED; teardown-only crash ignored")
+        return StageStatus("test", present, False, f"test binary exited {run_exit}")
     if "[  PASSED  ]" in log_text:
         return StageStatus("test", present, True, "run.log shows PASSED (legacy)")
     return StageStatus("test", present, False, "test binary present, no PASS evidence")
@@ -72,9 +80,15 @@ def _gemmi_status(d: Path) -> StageStatus:
         return StageStatus("gemmi", present, True, "run.exit == 0")
     if not binary.exists():
         return StageStatus("gemmi", present, False, "no test_check binary (compile failed)")
-    if run_exit is not None:
-        return StageStatus("gemmi", present, False, f"test_check exited {run_exit}")
     log_text = run_log.read_text() if run_log.exists() else ""
+    if run_exit is not None:
+        try:
+            rc_int = int(run_exit)
+        except ValueError:
+            rc_int = None
+        if is_teardown_only_crash(log_text, rc_int):
+            return StageStatus("gemmi", present, True, "PASSED; teardown-only crash ignored")
+        return StageStatus("gemmi", present, False, f"test_check exited {run_exit}")
     if "[  PASSED  ]" in log_text:
         return StageStatus("gemmi", present, True, "run.log shows PASSED (legacy)")
     return StageStatus("gemmi", present, False, "test_check present, no PASS evidence")

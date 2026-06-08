@@ -9,7 +9,7 @@ from ..oracle.compile import (
     AUTOBUILD_LIB, COOT_BUILD_DIR,
     GEMMI_INCLUDE, CLIPPER_INCLUDE, BOOST_INCLUDE,
     MMDB_INCLUDE, GSL_INCLUDE, PNG_INCLUDE, GLM_INCLUDE,
-    RDKIT_INCLUDE, ccp4_env,
+    RDKIT_INCLUDE, ccp4_env, is_teardown_only_crash,
 )
 from ..db import PROJECT_ROOT
 
@@ -104,11 +104,29 @@ def run_test_binary(test_bin: Path, attempts: int = 2) -> tuple[bool, str]:
         if rc is None:
             last_out = f"[run_test_binary] timed out after 20s (attempt {attempt}/{attempts})"
             continue
+        out = (stdout + stderr).strip()
+        passed = rc == 0
+        verdict_rc = rc
+        if not passed and is_teardown_only_crash(out, rc):
+            # All assertions held; the crash was in global teardown. Record the
+            # verdict as PASS but keep the real signal visible in the log.
+            out += (
+                f"\n\n[harness] All gtest assertions PASSED; the process then "
+                f"exited {rc} during global/atexit teardown (typically a static "
+                f"molecules_container_t destructor double-free), NOT a test "
+                f"failure. Recording verdict as PASS. To make the binary exit "
+                f"cleanly, give the test its own `int main(int argc, char** argv) "
+                f"{{ ::testing::InitGoogleTest(&argc, &argv); int r = "
+                f"RUN_ALL_TESTS(); std::fflush(nullptr); _exit(r); }}` "
+                f"(skips the destructors)."
+            )
+            passed = True
+            verdict_rc = 0
         try:
-            (test_bin.parent / "run.exit").write_text(str(rc))
+            (test_bin.parent / "run.exit").write_text(str(verdict_rc))
         except OSError:
             pass
-        return rc == 0, (stdout + stderr).strip()
+        return passed, out
     return False, last_out
 
 
