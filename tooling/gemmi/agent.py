@@ -69,11 +69,19 @@ from .compile import (
     write_compile_script,
 )
 from .lint import gemmi_lint, lint_report
-from .name_check import name_check_report, has_name_findings
+from .name_check import name_check_report
 from .cheat_lookup import mmdb_to_gemmi, include_for_symbol
 from ..oracle.generate import OUT_ROOT, sanitize_name, find_function_dirs
 
 _GEMMI_NO_COMPILE_AFTER = 10
+
+# The pre-flight name check is advisory, not authoritative: the code-graph DB
+# does not index every real coot type, so it sometimes flags a genuine symbol.
+# Left as a hard gate it can dead-end the agent forever (it keeps "fixing" a
+# name that was never wrong). After this many CONSECUTIVE identical name-check
+# blocks we disarm it and let the real compiler be the judge — a true error
+# (e.g. a redefinition) then surfaces as an actionable compiler diagnostic.
+_NAME_CHECK_MAX_CONSECUTIVE_BLOCKS = 2
 
 # Absolute paths to data files (pdb/cif/mtz/map/ent) inside the original test
 # source. These fixtures are validated by the oracle stage and MUST carry over
@@ -1318,6 +1326,8 @@ def _make_tool_handlers(
     last_error_log = [None]
     assertion_warned = [False]
     draft_seq      = [0]
+    name_block_streak = [0]      # consecutive identical name-check blocks
+    last_name_report  = [None]   # text of the last name-check block
 
     def _save_drafts(files: dict[str, str | None]) -> None:
         """Snapshot the current state of each provided file under
@@ -1384,12 +1394,37 @@ def _make_tool_handlers(
         # whose qualified names don't resolve in the code graph DB or the
         # gemmi symbol index. Also a free fix cycle. Skipped when no DB
         # connection is available (older callers).
-        if conn is not None and has_name_findings(
-            function_hh, test_cc, function_cc, conn,
-        ):
-            return name_check_report(
-                function_hh, test_cc, function_cc, conn,
+        #
+        # The check is advisory: the DB doesn't index every real coot type, so
+        # it can flag a genuine symbol and trap the agent in a fix-the-non-bug
+        # loop. We therefore disarm it after a run of identical blocks and fall
+        # through to a real compile, where any true problem (a redefinition, a
+        # truly missing symbol) surfaces as an actionable compiler diagnostic.
+        report = (
+            name_check_report(function_hh, test_cc, function_cc, conn)
+            if conn is not None else ""
+        )
+        if report:
+            if report == last_name_report[0]:
+                name_block_streak[0] += 1
+            else:
+                last_name_report[0] = report
+                name_block_streak[0] = 1
+            if name_block_streak[0] <= _NAME_CHECK_MAX_CONSECUTIVE_BLOCKS:
+                return report
+            # Disarmed: stop blocking and let the compiler decide.
+            name_check_advisory = (
+                "⚠ Name check still flags the names below, but it is only "
+                "advisory and the DB does not index every real symbol — "
+                "proceeding to a real compile. If the compiler reports a "
+                "'redefinition' you are re-declaring a type that already "
+                "exists; include its header instead of redefining it.\n"
+                + report.split("\n\n", 1)[-1]
             )
+        else:
+            name_block_streak[0] = 0
+            last_name_report[0] = None
+            name_check_advisory = ""
 
         attempts[0] += 1
         gemmi_subdir.mkdir(exist_ok=True)
@@ -1445,8 +1480,9 @@ def _make_tool_handlers(
                     [test_cc or "", function_cc or "", function_hh or ""]
                 )
                 tail = "".join("\n\n" + a for a in code_advisories(combined))
+            head = f"{name_check_advisory}\n\n" if name_check_advisory else ""
             return (
-                f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}).\n"
+                f"{head}Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}).\n"
                 f"{status}\n{run_out}{tail}"
             )
         last_binary[0] = None
@@ -1456,6 +1492,8 @@ def _make_tool_handlers(
         )
         prefix = (f"Compilation FAILED (attempt {attempts[0]}/"
                   f"{MAX_COMPILE_ATTEMPTS}):\n")
+        if name_check_advisory:
+            prefix += name_check_advisory + "\n\n"
         if suggestion:
             prefix += suggestion + "\n\n"
         if directive:
@@ -1931,6 +1969,33 @@ def generate_gemmi_port_with_agent(
             for fname, body in draft.items():
                 (draft_dir / fname).write_text(body)
 
+    def _save_draft_from_disk(compile_result: str) -> None:
+        # write_gemmi_file / patch_gemmi_file mutate the port files on disk and
+        # compile them, but carry no file contents in their tool args, so
+        # _save_draft_from_compile can't capture the result. If that on-disk
+        # state actually passed, snapshot it from disk — otherwise a port the
+        # agent fixed via patch/write is lost when an empty final turn falls
+        # back to a stale (or empty) last_draft.
+        passed = ("All tests PASSED." in compile_result
+                  and "Compilation succeeded" in compile_result)
+        if not passed:
+            return
+        hh = (gemmi_subdir / "function.hh")
+        tc = (gemmi_subdir / "test.cc")
+        cc = (gemmi_subdir / "function.cc")
+        if not (hh.is_file() and tc.is_file()):
+            return
+        hh_txt, tc_txt = hh.read_text(), tc.read_text()
+        if len(hh_txt) > 50 and len(tc_txt) > 100 and "#include" in tc_txt:
+            draft = {"function.hh": hh_txt, "test.cc": tc_txt}
+            if cc.is_file():
+                draft["function.cc"] = cc.read_text()
+            last_draft[0] = draft
+            draft_dir = gemmi_subdir / "draft"
+            draft_dir.mkdir(exist_ok=True)
+            for fname, body in draft.items():
+                (draft_dir / fname).write_text(body)
+
     def _run_tool_calls(tool_calls: list[dict]) -> list[dict]:
         results: list[dict] = []
         for call in tool_calls:
@@ -2004,6 +2069,8 @@ def generate_gemmi_port_with_agent(
             # fallback, which then fails again at verify time.
             if name == "compile_gemmi":
                 _save_draft_from_compile(args, result_text)
+            elif name in ("write_gemmi_file", "patch_gemmi_file"):
+                _save_draft_from_disk(result_text)
             if name in ("compile_gemmi", "write_gemmi_file", "run_gemmi_test"):
                 non_compile_tool_calls[0] = 0
             else:
@@ -2203,8 +2270,15 @@ def generate_gemmi_port_with_agent(
     else:
         trace_lines.append("[agent] Turn limit reached.\n")
 
-    if not _is_usable(final_blocks) and _is_usable(last_draft[0]):
-        trace_lines.append("[agent] Falling back to last compile_gemmi draft.\n")
+    # last_draft is only ever set on a VERIFIED pass (All tests PASSED). A
+    # re-emitted final block is unverified narration the model often regresses,
+    # so prefer the verified draft whenever we have one — not just as a fallback
+    # when the final block is missing.
+    if _is_usable(last_draft[0]) and last_draft[0] != final_blocks:
+        trace_lines.append(
+            "[agent] Preferring last verified-passing draft over re-emitted "
+            "final blocks.\n"
+        )
         final_blocks = last_draft[0]
     elif not _is_usable(final_blocks):
         trace_lines.append("[agent] No usable output — issuing rescue prompt.\n")

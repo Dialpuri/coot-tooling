@@ -402,7 +402,17 @@ def generate_test_with_agent(
             new_s = args.get("new_string")
             if old_s is None or new_s is None:
                 return "Error: patch_test requires both 'old_string' and 'new_string'."
-            return patch_handler(old_s, new_s, bool(args.get("replace_all", False)))
+            result = patch_handler(old_s, new_s, bool(args.get("replace_all", False)))
+            # A successful patch leaves the corrected code ONLY on disk;
+            # last_draft[0] still holds the pre-patch write_and_compile_test
+            # code. Without this sync, an empty final turn falls back to that
+            # stale (often non-compiling) draft and the finalize step fails a
+            # test the agent had actually fixed.
+            if compiled_ok():
+                tc = test_subdir / "test.cc"
+                if tc.exists():
+                    _save_draft(tc.read_text())
+            return result
         return _dispatch(conn, name, args)
 
     parts: list[str] = []
@@ -718,6 +728,22 @@ def generate_test_with_agent(
                     trace_lines.append(f"[nudge — ext turn {ext_turn + 1}]\n{textwrap.indent(_TEST_NUDGE, '  ')}\n")
             else:
                 trace_lines.append("[agent] Extension exhausted without final answer.\n")
+
+    # The on-disk test.cc that last compiled is the agent's VERIFIED work
+    # (edited via write_and_compile_test / patch_test and run with run_test).
+    # A final ```cpp block is just narration — the model routinely re-types it
+    # from memory and regresses fixes it already applied (e.g. dropping the
+    # std::string wraps that made char* comparisons pass). Trust the verified
+    # file over the re-emission whenever the last compile succeeded.
+    on_disk_test = test_subdir / "test.cc"
+    if compiled_ok() and on_disk_test.is_file():
+        disk_src = on_disk_test.read_text()
+        if _is_usable(disk_src) and disk_src != test_code:
+            trace_lines.append(
+                "[agent] Preferring verified on-disk test.cc over re-emitted "
+                "final block.\n"
+            )
+            test_code = disk_src
 
     if not _is_usable(test_code):
         if _is_usable(last_draft[0]):
