@@ -204,6 +204,48 @@ def get_function(
     """, (f"%::{short}",)).fetchone()
 
 
+def get_function_source_file(
+    conn: sqlite3.Connection,
+    qname: str,
+    sig_hash_: str | None = None,
+) -> str | None:
+    """Absolute path of the file that DEFINES this overload.
+
+    Used by phase-2 reconstitution to group ports by the source file their
+    MMDB original lives in. `get_function` already prefers definition rows
+    (is_definition DESC) and pins the overload when `sig_hash_` is given, so
+    the returned `file` is the defining translation unit when one exists.
+    """
+    row = get_function(conn, qname, sig_hash_)
+    return row["file"] if row else None
+
+
+def group_entries_by_source_file(
+    conn: sqlite3.Connection,
+    entries: list[tuple[str, str | None]],
+) -> dict[str, list[tuple[str, str | None]]]:
+    """Bucket (qname, sig_hash) entries by the source file that defines them.
+
+    Methods defined inline in a class header (path ends in .hh) are redirected
+    to the sibling implementation file of the same stem when it exists on disk
+    (e.g. coot-molecule.hh -> coot-molecule.cc), so their reconstituted
+    definitions land in a `<stem>_gemmi.cc` rather than a header-only file.
+    Entries whose defining file cannot be resolved are collected under the
+    empty-string key so callers can report them.
+
+    Buckets and the entries within them preserve first-seen order.
+    """
+    buckets: dict[str, list[tuple[str, str | None]]] = {}
+    for qname, sh in entries:
+        path = get_function_source_file(conn, qname, sh)
+        if path and path.endswith(".hh"):
+            sibling = path[:-3] + ".cc"
+            if Path(sibling).exists():
+                path = sibling
+        buckets.setdefault(path or "", []).append((qname, sh))
+    return buckets
+
+
 def get_containing_class(conn: sqlite3.Connection, qname: str) -> sqlite3.Row | None:
     if "::" not in qname:
         return None
