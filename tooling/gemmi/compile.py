@@ -14,7 +14,7 @@ from pathlib import Path
 from ..oracle.compile import (
     CXX, GEMMI_INCLUDE, BOOST_INCLUDE, GSL_INCLUDE, GLM_INCLUDE,
     CLIPPER_INCLUDE, AUTOBUILD_LIB, RDKIT_INCLUDE, COOT_BUILD_DIR, ccp4_env,
-    is_teardown_only_crash,
+    is_teardown_only_crash, COOT_DEFINES_STR,
 )
 
 CLIPPER_LIBS = [
@@ -61,7 +61,7 @@ def make_gemmi_compile_cmd(
         "MolTransforms", "RDInchiLib",
     ])
     return (
-        f'{CXX} -std=c++20 {sources} -o "{output_bin.absolute()}" '
+        f'{CXX} -std=gnu++20 {COOT_DEFINES_STR} {sources} -o "{output_bin.absolute()}" '
         f'{includes} -pthread '
         f'-Wl,-rpath,{GEMMI_LIB_DIR} '
         f'-Wl,-rpath,{AUTOBUILD_LIB} '
@@ -97,12 +97,17 @@ def run_gemmi_test_binary(test_bin: Path, attempts: int = 2) -> tuple[bool, str]
     cwd = str(test_bin.parent)
     last_out = ""
     for attempt in range(1, attempts + 1):
+        # Capture BYTES and decode with errors="replace": test output loads real
+        # structures and can carry non-UTF-8 bytes (e.g. 0xb0 '°' in cell
+        # angles), which text=True would crash on with UnicodeDecodeError.
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=cwd, start_new_session=True, env=ccp4_env(),
         )
         try:
-            stdout, stderr = proc.communicate(timeout=20)
+            out_b, err_b = proc.communicate(timeout=20)
+            stdout = out_b.decode("utf-8", errors="replace")
+            stderr = err_b.decode("utf-8", errors="replace")
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)

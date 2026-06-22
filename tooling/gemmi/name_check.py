@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from functools import lru_cache
 
 from ..db import get_type
 from .cheat_lookup import _load_index
@@ -71,6 +72,31 @@ def _exists_in_gemmi_index(name: str) -> bool:
     if tail in _TAIL_ALLOWLIST:
         return True
     return tail in _load_index()
+
+
+@lru_cache(maxsize=1)
+def _gemmi_index_casefold() -> dict[str, list[str]]:
+    """Map casefolded tail -> list of canonical tails sharing that spelling.
+
+    Lets us detect a symbol that exists in gemmi but was written with the
+    wrong capitalization (e.g. `gemmi::structure` for `gemmi::Structure`),
+    which a case-sensitive `tail in index` check misses entirely.
+    """
+    out: dict[str, list[str]] = {}
+    for sym in _load_index():
+        out.setdefault(sym.casefold(), []).append(sym)
+    return out
+
+
+def _casefold_matches_gemmi(name: str) -> list[str]:
+    """Canonical gemmi symbols that match `name`'s tail case-insensitively
+    but not exactly (i.e. a pure capitalization mistake). Empty if the exact
+    name is already valid or no case-variant exists."""
+    if not name.startswith("gemmi::"):
+        return []
+    tail = name.rsplit("::", 1)[-1]
+    canon = _gemmi_index_casefold().get(tail.casefold(), [])
+    return [f"gemmi::{c}" for c in canon if c != tail]
 
 
 def _exists_in_db(conn: sqlite3.Connection, name: str) -> bool:
@@ -166,10 +192,15 @@ def check_names(source: str, conn: sqlite3.Connection) -> list[dict]:
         if (root, tail) in seen_pair:
             continue
         seen_pair.add((root, tail))
+        # An exact case-insensitive hit means the symbol exists but is
+        # miscapitalized — surface it first; it's the highest-confidence fix.
+        case_hits = _casefold_matches_gemmi(name)
+        fuzzy = [s for s in _suggest_near_gemmi(name) if s not in case_hits]
         findings.append({
             "name": name,
             "root": root,
-            "suggestions": _suggest_near_gemmi(name),
+            "case_mismatch": bool(case_hits),
+            "suggestions": case_hits + fuzzy,
         })
     return findings
 
@@ -212,7 +243,12 @@ def name_check_findings(
         if not body:
             continue
         for f in check_names(body, conn):
-            msg = f"{label}: `{f['name']}` — not declared in any indexed header"
+            if f.get("case_mismatch"):
+                msg = (f"{label}: `{f['name']}` — wrong capitalization; "
+                       "C++ names are case-sensitive")
+            else:
+                msg = (f"{label}: `{f['name']}` — "
+                       "not declared in any indexed header")
             if f["suggestions"]:
                 msg += (" (did you mean "
                         + ", ".join(f"`{s}`" for s in f["suggestions"][:3])

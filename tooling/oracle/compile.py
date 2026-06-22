@@ -76,6 +76,31 @@ PNG_INCLUDE    = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
 GLM_INCLUDE    = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
 RDKIT_INCLUDE  = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include/rdkit"
 
+# Preprocessor defines that MUST match coot's own build, because they gate
+# `#ifdef` member variables in coot's classes and therefore change struct
+# layout / sizeof. If we compile a TU that constructs a coot object (e.g.
+# `molecules_container_t mc;`) WITHOUT these, our TU reserves a smaller object
+# than the constructor in libcootapi.so actually writes, and the constructor
+# overruns the stack/heap slot — silently corrupting adjacent variables.
+#
+# Proven driver: -DCLIPPER_HAS_TOP8000 alone grows sizeof(molecules_container_t)
+# from 1856 -> 1984 (a Top8000 rama/rotamer member). The rest are matched to
+# coot's compile_commands.json so future conditional members stay in sync.
+# Source: build-linux/compile_commands.json (api/molecules-container.cc entry).
+COOT_DEFINES = [
+    "-DCLIPPER_HAS_TOP8000",          # proven 128-byte layout driver
+    "-DMAKE_ENHANCED_LIGAND_TOOLS=1",
+    "-DUSE_GEMMI",
+    "-DUSE_LIBPNG=1",
+    "-DHAVE_GSL",
+    "-DHAVE_BOOST",
+    "-DHAVE_BOOST_THREAD",
+    "-DHAVE_CXX_THREAD",
+    "-DHAVE_SSMLIB",
+    "-DNDEBUG",
+]
+COOT_DEFINES_STR = " ".join(COOT_DEFINES)
+
 
 def make_compile_cmd(oracle_cc: Path, output_bin: Path) -> str:
     includes = [PROJECT_ROOT, GEMMI_INCLUDE, RDKIT_INCLUDE]
@@ -95,7 +120,7 @@ def make_compile_cmd(oracle_cc: Path, output_bin: Path) -> str:
     gsl_libraries = "-lgsl -lgslcblas"
 
     return (
-        f'{CXX} -std=c++20 -fno-access-control "{oracle_cc}" -o "{output_bin}" '
+        f'{CXX} -std=gnu++20 -fno-access-control {COOT_DEFINES_STR} "{oracle_cc}" -o "{output_bin}" '
         f'{includes} '
         f'-Wl,-rpath,{AUTOBUILD_LIB} '
         f'-Wl,-rpath,{COOT_BUILD_DIR} '

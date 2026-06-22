@@ -126,6 +126,20 @@ Rules for the lift:
 5. The adapted test must construct the object from the SAME structure the
    original test loaded, e.g. `{ns}::{cls} m(st); ... m.foo(args) ...`, keeping
    every original assertion (expected values are frozen).
+6. NEVER redefine or stub an existing coot/gemmi/clipper type. If the function
+   uses a type like `residue_spec_t`, `atom_spec_t`, `simple_mesh_t`,
+   `Cartesian`, `save_info_t`, `protein_geometry`, ... `#include` the real coot
+   header that declares it — do NOT paste a local `struct`/`class` of the same
+   name. A duplicate definition compiles in isolation but collides the moment
+   the class is merged with its siblings, so it is always wrong here.
+7. If the function calls ANOTHER method of this same class — recognisable as a
+   `<name>_gemmi(this->{member}, ...)` style call to a sibling that was also
+   ported — call it through the class instead: `this-><name>(...)` (drop the
+   `_gemmi` suffix and the structure argument). Do NOT call the standalone
+   `<name>_gemmi` free function; it does not exist in the merged class.
+8. Calls to free functions in OTHER namespaces (e.g. `coot::util::foo_gemmi`)
+   stay as free-function calls — their headers are included by the merge. Only
+   sibling METHODS of this class get rewritten to `this->...` (rule 7).
 """
 
 

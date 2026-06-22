@@ -111,108 +111,34 @@ INCLUDE_ROOTS = [
 
 _TEST_DATA_DIR = Path(__file__).parent.parent.parent / "test-data"
 
-
-_STANDARD_AA = {
-    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
-    "SEC", "PYL",
-}
+from .pdb_selector import DEFAULT_FIXTURE, panel_overview
 
 
-def _ranges(nums: list[int]) -> str:
-    """Compress a sorted list of integers into a compact range string."""
-    if not nums:
-        return ""
-    ranges: list[str] = []
-    start = prev = nums[0]
-    for n in nums[1:]:
-        if n == prev + 1:
-            prev = n
-        else:
-            ranges.append(str(start) if start == prev else f"{start}-{prev}")
-            start = prev = n
-    ranges.append(str(start) if start == prev else f"{start}-{prev}")
-    return ", ".join(ranges)
+def make_oracle_instructions() -> str:
+    """Build the ORACLE_INSTRUCTIONS block.
 
-
-def _pdb_summary(pdb_path: str) -> str:
-    """Parse a PDB file and return a compact structure-content summary."""
-    path = Path(pdb_path)
-    if not path.exists():
-        return ""
-
-    chain_residues: dict[str, dict[int, str]] = defaultdict(dict)  # chain -> {seqnum -> resname}
-    with path.open() as fh:
-        for line in fh:
-            rec = line[:6].strip()
-            if rec not in ("ATOM", "HETATM"):
-                continue
-            try:
-                resname = line[17:20].strip()
-                chain = line[21].strip() or " "
-                seqnum = int(line[22:26].strip())
-            except (ValueError, IndexError):
-                continue
-            chain_residues[chain][seqnum] = resname
-
-    if not chain_residues:
-        return ""
-
-    lines: list[str] = ["STRUCTURE CONTENT:"]
-    has_ligand = False
-    for chain in sorted(chain_residues):
-        residues = chain_residues[chain]
-        aa_nums: list[int] = []
-        water_nums: list[int] = []
-        ligands: list[tuple[int, str]] = []
-        for seqnum, resname in sorted(residues.items()):
-            if resname in _STANDARD_AA:
-                aa_nums.append(seqnum)
-            elif resname == "HOH":
-                water_nums.append(seqnum)
-            else:
-                ligands.append((seqnum, resname))
-                has_ligand = True
-
-        parts: list[str] = []
-        if aa_nums:
-            parts.append(f"{len(aa_nums)} std amino acids (seq {_ranges(aa_nums)})")
-        if water_nums:
-            parts.append(f"{len(water_nums)} HOH")
-        for seqnum, resname in ligands:
-            parts.append(f"ligand {resname} at seq {seqnum}")
-        lines.append(f"  Chain {chain}: {'; '.join(parts)}")
-
-    if not has_ligand:
-        lines.append("  (no non-water ligands)")
-    return "\n".join(lines)
-
-
-def make_oracle_instructions(pdb_path: str, pdb_note: str = "") -> str:
-    """Build the ORACLE_INSTRUCTIONS block with the given PDB path.
-
-    pdb_note is injected after the PDB line when the choice was ambiguous —
-    it lists all available PDB files so the LLM can override the default.
+    No per-function structure is selected: the oracle reads its path from argv
+    and is verified across the whole fixture panel, so the prompt shows the
+    PANEL overview (every fixture's shape) rather than one structure's content.
     """
-    pdb_line = f"       PDB: {pdb_path}"
-    if pdb_note:
-        pdb_line += (
-            "\n       (or choose a more appropriate file from the list below —\n"
-            f"        the selected path is only a default)\n{pdb_note}"
-        )
-    pdb_summary = _pdb_summary(pdb_path)
-    pdb_summary_block = f"\n{pdb_summary}\n" if pdb_summary else ""
+    default_path = _TEST_DATA_DIR / DEFAULT_FIXTURE
     return f"""\
 Write a complete, compilable C++ program (oracle.cc) that observes the inputs
 and outputs of the function marked FUNCTION TO OBSERVE below.
 
 Requirements:
-  1. Be self-contained — hardcode the test file paths below, do not use argc/argv.
-{pdb_line}
-       MTZ: {_TEST_DATA_DIR}/example.mtz
-{pdb_summary_block}  2. Load the structure using the hardcoded path.
-  3. Navigate the structure to reach a valid receiver/input for the function.
-     Use only residues/chains listed in STRUCTURE CONTENT above.
+  1. Read the structure file from argv[1] and an optional MTZ from argv[2]. The
+     program is run REPEATEDLY across the fixture panel below, so do NOT hardcode
+     a path. Use `{default_path}` as the argc < 2 fallback so it is runnable by
+     hand.
+       MTZ: argv[2] (the paired map for the fixture, when one exists)
+{panel_overview()}
+  2. Load the structure from argv[1] (read_pdb handles .pdb and .cif).
+     If it fails to load, exit non-zero — that fixture is dropped, not faked.
+  3. Navigate GENERICALLY to a valid receiver/input: derive it from whatever is
+     loaded at runtime (first chain / first residue / first atom) and build any
+     CID or spec from those. Do NOT hardcode a chain/residue that exists in only
+     one structure — the panel spans protein, RNA, ligand and glycoprotein.
   4. Call the function.
   5. Print every input value and every meaningful output value using this format:
        INPUT  <name>: <value>
@@ -233,7 +159,7 @@ what objects are needed. Only use types and methods shown in the context below.\
 
 
 # Backward-compat constant used by external code that imports ORACLE_INSTRUCTIONS.
-ORACLE_INSTRUCTIONS = make_oracle_instructions(str(_TEST_DATA_DIR / "example.pdb"))
+ORACLE_INSTRUCTIONS = make_oracle_instructions()
 
 
 def _to_include(path: str) -> str:
@@ -472,8 +398,6 @@ def _extract_return_type(source_code: str, function_qname: str) -> str:
 def build_oracle_prompt(
     conn: sqlite3.Connection,
     function_qname: str,
-    pdb_file: str = "example.pdb",
-    pdb_note: str = "",
     sig_hash: str | None = None,
 ) -> str | None:
     fn = get_function(conn, function_qname, sig_hash)
@@ -549,7 +473,7 @@ def build_oracle_prompt(
     # A hand-curated override file takes precedence over the automated DB lookup.
     if containing_class:
         cls_qname = containing_class["qualified_name"]
-        full_pdb_path = str(_TEST_DATA_DIR / pdb_file)
+        full_pdb_path = str(_TEST_DATA_DIR / DEFAULT_FIXTURE)
         override = _load_override(cls_qname, pdb_path=full_pdb_path)
         if override:
             section(f"`{cls_qname}` construction (curated)", override)
@@ -570,7 +494,7 @@ def build_oracle_prompt(
     for dep_qname, dep_text in construction_overrides_for_function(
         fn["source_code"] or "",
         exclude_qname=containing_class["qualified_name"] if containing_class else None,
-        pdb_path=str(_TEST_DATA_DIR / pdb_file),
+        pdb_path=str(_TEST_DATA_DIR / DEFAULT_FIXTURE),
     ):
         section(f"`{dep_qname}` construction (curated)", dep_text)
 
@@ -669,5 +593,5 @@ def build_oracle_prompt(
 
     context_block = "\n\n".join(parts)
 
-    instructions = make_oracle_instructions(str(_TEST_DATA_DIR / pdb_file), pdb_note)
+    instructions = make_oracle_instructions()
     return f"{instructions}\n\n{context_block}\n"

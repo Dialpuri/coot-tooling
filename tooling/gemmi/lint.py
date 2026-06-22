@@ -202,11 +202,101 @@ def _missing_header_findings(code: str) -> list[str]:
     return out
 
 
-def gemmi_lint(code: str) -> list[str]:
+# ── redefinition of real coot types ──────────────────────────────────────────
+#
+# The single worst failure mode: a port stubs out a real coot type
+# (`struct simple_mesh_t { ... }`) instead of #including its header, so the body
+# can fabricate a result that games the frozen assertions. It compiles in
+# isolation but is wrong, and the stub leaks into the reconstituted class. This
+# rule forbids redefining any of coot's OWN record types (scoped to `coot::` so
+# std/gemmi/clipper short-name collisions can't false-positive) and points the
+# agent at the real header instead.
+
+# A `struct`/`class Name {` definition (optional `final` / base-clause). A bare
+# forward decl (`class Foo;`) has no `{` and is not matched.
+_TYPE_DEF_RE = re.compile(
+    r"\b(?:struct|class)\s+([A-Za-z_]\w*)\s*(?:final\s*)?(?::[^{;]*)?\{")
+
+# Generic single-word names that legitimately recur as local helpers; too risky
+# to hard-block even though a coot:: type shares the name.
+_GENERIC_TYPE_NAMES = frozenset({
+    "atom", "bond", "residue", "chain", "link", "node", "edge", "cell",
+    "point", "line", "range", "result", "state", "data", "info", "item",
+})
+
+# Lazily-built {short_name: header_path}; one DB, so a module-level cache is fine.
+_COOT_TYPE_INDEX: dict[str, str] | None = None
+
+
+def coot_record_type_index(conn) -> dict[str, str]:
+    """Map coot's own record type short-names -> the header that declares them.
+
+    Used by the redefinition rule to (a) recognise a stubbed coot type and
+    (b) suggest the include that replaces the stub. Cached across calls.
+    """
+    global _COOT_TYPE_INDEX
+    if _COOT_TYPE_INDEX is not None:
+        return _COOT_TYPE_INDEX
+    rows = conn.execute("""
+        SELECT t.qualified_name, fi.path
+        FROM types t JOIN files fi ON fi.id = t.file_id
+        WHERE t.kind IN ('CLASS_DECL', 'STRUCT_DECL', 'CLASS_TEMPLATE',
+                         'class', 'struct')
+          AND t.qualified_name LIKE 'coot::%'
+    """).fetchall()
+    idx: dict[str, str] = {}
+    for qn, path in rows:
+        short = qn.rsplit("::", 1)[-1]
+        if len(short) >= 4 and re.match(r"^[A-Za-z_]\w*$", short):
+            idx.setdefault(short, path)
+    _COOT_TYPE_INDEX = idx
+    return idx
+
+
+def _tree_relative(path: str) -> str:
+    """Best-effort coot-tree-relative include path for a header on disk."""
+    from ..db import PROJECT_ROOT
+    if path.startswith(PROJECT_ROOT + "/"):
+        return path[len(PROJECT_ROOT) + 1:]
+    return path.rsplit("/", 1)[-1]
+
+
+def redefined_coot_type_findings(code: str, type_index: dict[str, str]) -> list[str]:
+    """Flag stub redefinitions of real coot types that lack the real include.
+
+    Only fires when the header is NOT already included — if the agent both
+    stubs and includes the real type, the compiler's redefinition error is the
+    clearer signal, so we leave that to compile_gemmi.
+    """
+    out: list[str] = []
+    includes = code  # cheap substring test below against the whole file
+    for m in _TYPE_DEF_RE.finditer(code):
+        name = m.group(1)
+        if name.lower() in _GENERIC_TYPE_NAMES:
+            continue
+        header = type_index.get(name)
+        if not header:
+            continue
+        rel = _tree_relative(header)
+        if rel.rsplit("/", 1)[-1] in includes:        # real header already in
+            continue
+        line_no = code.count("\n", 0, m.start()) + 1
+        out.append(
+            f"line {line_no}: `{m.group(0).rstrip('{').strip()}` redefines the "
+            f"real coot type `coot::{name}` — DELETE this stub and "
+            f'`#include "{rel}"` instead. A local copy compiles here but '
+            f"fabricates the type, lets the body fake the result, and collides "
+            f"the moment the port is reconstituted."
+        )
+    return out
+
+
+def gemmi_lint(code: str, coot_types: dict[str, str] | None = None) -> list[str]:
     """Return a list of human-readable findings, empty if clean.
 
     Each finding is `"line N: <fix-message>"` so the agent can locate the
-    offending line directly.
+    offending line directly. When `coot_types` (a `coot_record_type_index`) is
+    supplied, the real-coot-type redefinition rule is enabled too.
     """
     findings: list[str] = []
     for pat, fix in _PATTERNS:
@@ -218,6 +308,8 @@ def gemmi_lint(code: str) -> list[str]:
             line_no = code.count("\n", 0, m.start()) + 1
             findings.append(f"line {line_no}: {fix}")
     findings.extend(_missing_header_findings(code))
+    if coot_types:
+        findings.extend(redefined_coot_type_findings(code, coot_types))
     # Dedup while preserving order.
     seen: set[str] = set()
     deduped: list[str] = []

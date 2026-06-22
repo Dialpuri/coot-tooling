@@ -483,7 +483,22 @@ def _archive_output_dir(out_dir: Path, log) -> None:
     log(f"retry-failed: archived previous output to {archive.name}/")
 
 
-def _process(
+def _process(*args, **kwargs) -> Result:
+    """Wrapper that guarantees this thread's heartbeat state is cleared.
+
+    ``_process_impl`` has many early ``return`` paths (oracle/test failures,
+    context-size skips, etc.) that previously left ``_worker_state`` populated.
+    The last function a worker thread handled would then linger in the
+    heartbeat output forever with an ever-growing ``age``. Clearing in a
+    ``finally`` ensures the entry is always removed on exit.
+    """
+    try:
+        return _process_impl(*args, **kwargs)
+    finally:
+        _clear_worker_state()
+
+
+def _process_impl(
     qname: str,
     sig_hash: str | None,
     model: str,

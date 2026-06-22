@@ -138,6 +138,32 @@ def _cmd_list(
           + ("" if verify else "   [run with --verify to detect broken ports]"))
 
 
+def _cmd_deps(class_name: str) -> None:
+    """Print the dependency closure: callee units to reconstitute before the class."""
+    from .deps import reconstitution_closure
+    conn = connect()
+    try:
+        rep = reconstitution_closure(conn, class_name)
+    finally:
+        conn.close()
+    free, klass = rep.free_function_units, rep.class_units
+    print(f"Dependency closure for {class_name}: {len(rep.units)} unit(s) "
+          f"to reconstitute first\n")
+    print(f"  free-function units ({len(free)}) — deterministic merge, no lift, "
+          f"no molecule_t re-lift:")
+    for u in free:
+        src = os.path.basename(u.source_file) if u.source_file else "?"
+        print(f"      {u.container or '??':28s}  {u.qname or u.unit_dir}  [{src}]")
+    print(f"\n  class units ({len(klass)}) — ClassModel lift; dependent methods re-lifted:")
+    for u in klass:
+        src = os.path.basename(u.source_file) if u.source_file else "?"
+        print(f"      {u.container or '??':28s}  {u.qname or u.unit_dir}  [{src}]")
+    if rep.unresolved:
+        print(f"\n  unresolved ({len(rep.unresolved)}) — port dir not matched in DB:")
+        for u in rep.unresolved:
+            print(f"      {u.unit_dir}")
+
+
 def _lift_entries(
     entries: list[tuple[str, str | None]],
     class_name: str,
@@ -205,7 +231,9 @@ def main(argv: list[str] | None = None) -> None:
         description="Reconstitute verified gemmi ports into a parallel <class>_gemmi class.",
     )
     p.add_argument("class_name", help="Fully-qualified class name, e.g. coot::molecule_t")
-    p.add_argument("--filter", metavar="STR", help="Only methods whose qualified name contains STR")
+    p.add_argument("--filter", metavar="STR",
+                   help="Only methods whose qualified name contains STR "
+                        "(comma-separated = match any)")
     p.add_argument("--model", default=None,
                    help=f"Model id (default: {OPENAI_MODEL} for openai, else {DEFAULT_MODEL})")
     p.add_argument("--backend", default="openai", choices=["ollama", "openai"],
@@ -218,7 +246,13 @@ def main(argv: list[str] | None = None) -> None:
                    help="Lift only; do not merge")
     p.add_argument("--out-dir", default=None,
                    help="Merge output dir (default: generated-tests/_reconstituted)")
+    p.add_argument("--check", action="store_true",
+                   help="After merge, run clang-tidy (clang-diagnostic-*) on the "
+                        "merged .cc files and report per-file errors/warnings")
     p.add_argument("--list", action="store_true", help="List ports + lift status and exit")
+    p.add_argument("--deps", action="store_true",
+                   help="Show the cross-unit dependency closure (callee namespaces/"
+                        "classes that must be reconstituted first) and exit")
     p.add_argument("--verify", action="store_true",
                    help="With --list: compile each phase-1 port to flag broken/stale "
                         "ones as no-port (slow; honours --workers and caches the verdict)")
@@ -232,13 +266,18 @@ def main(argv: list[str] | None = None) -> None:
         print(f"No mmdb methods found for class: {args.class_name}", file=sys.stderr)
         sys.exit(1)
     if args.filter:
-        entries = [(q, s) for (q, s) in entries if args.filter in q]
+        needles = [n for n in (s.strip() for s in args.filter.split(",")) if n]
+        entries = [(q, s) for (q, s) in entries if any(n in q for n in needles)]
         if not entries:
             print(f"No methods match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
 
     if args.list:
         _cmd_list(args.class_name, entries, verify=args.verify, workers=args.workers)
+        return
+
+    if args.deps:
+        _cmd_deps(args.class_name)
         return
 
     os.environ["CT_BACKEND"] = args.backend
@@ -268,6 +307,39 @@ def main(argv: list[str] | None = None) -> None:
             print(f"[merge] warnings ({len(res.warnings)}):")
             for w in res.warnings:
                 print(f"    {w}")
+
+        if args.check:
+            _run_check(res.source_paths)
+
+
+def _run_check(source_paths: list[Path]) -> None:
+    from .check import check_files, clang_tidy_path
+    if clang_tidy_path() is None:
+        print("\n[check] clang-tidy not found on PATH — skipping "
+              "(install it, e.g. into the .venv)", file=sys.stderr)
+        return
+    if not source_paths:
+        print("\n[check] no merged .cc files to lint")
+        return
+    print(f"\n[check] clang-tidy on {len(source_paths)} merged file(s)...")
+    result = check_files(source_paths)
+    if result.header_errors:
+        print(f"[check] shared header: {len(result.header_errors)} error(s) "
+              f"(seen by every .cc that includes it)")
+        for e in result.header_errors:
+            print(f"        {e}")
+    for r in result.reports:
+        status = "ok" if r.ok else f"{len(r.errors)} error(s)"
+        extra = f", {len(r.warnings)} warning(s)" if r.warnings else ""
+        print(f"[check] {r.path.name}: {status}{extra}")
+        for e in r.errors:
+            print(f"        {e}")
+    if result.ok:
+        print("[check] PASS — merged output is clang-clean (no errors)")
+    else:
+        print(f"[check] FAIL — {result.n_errors} unique error(s) "
+              f"({len(result.header_errors)} in the shared header)")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

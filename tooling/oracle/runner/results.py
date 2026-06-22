@@ -119,3 +119,62 @@ def load_result(path: Path) -> OracleResult:
     data = json.loads(path.read_text())
     data.setdefault("cases", [])
     return OracleResult(**data)
+
+
+# ── multi-fixture (panel) results ─────────────────────────────────────────────
+
+@dataclass
+class OraclePanelResult:
+    """One oracle binary run across the multi-fixture panel.
+
+    `per_fixture` maps the structure fixture's basename (e.g. "example-na.pdb")
+    to that run's OracleResult. A fixture is "passing" when it exited 0 AND
+    produced at least one OUTPUT line — the same bar the test stage will freeze
+    per fixture. The primary fixture (panel order) is surfaced for back-compat
+    with the single-fixture coverage/notes paths.
+    """
+    per_fixture: dict[str, OracleResult] = field(default_factory=dict)
+
+    @property
+    def passing_fixtures(self) -> list[str]:
+        return [f for f, r in self.per_fixture.items() if r.success and r.outputs]
+
+    @property
+    def success(self) -> bool:
+        """At least one fixture produced observable output."""
+        return bool(self.passing_fixtures)
+
+    def primary(self) -> OracleResult | None:
+        """First passing fixture's result (panel order), else first that ran."""
+        for f, r in self.per_fixture.items():
+            if r.success and r.outputs:
+                return r
+        for r in self.per_fixture.values():
+            if r.ran:
+                return r
+        return next(iter(self.per_fixture.values()), None)
+
+    def summary(self) -> str:
+        n_pass = len(self.passing_fixtures)
+        lines = [f"PANEL: {n_pass}/{len(self.per_fixture)} fixture(s) produced output"]
+        for fixture, r in self.per_fixture.items():
+            mark = "ok " if (r.success and r.outputs) else "—  "
+            detail = ("OK" if r.success else f"exit {r.returncode}")
+            if r.success and not r.outputs:
+                detail += ", no OUTPUT"
+            lines.append(f"  [{mark}] {fixture}: {detail}")
+        return "\n".join(lines)
+
+
+def save_panel_result(path: Path, panel: OraclePanelResult) -> None:
+    path.write_text(json.dumps(
+        {f: asdict(r) for f, r in panel.per_fixture.items()}, indent=2))
+
+
+def load_panel_result(path: Path) -> OraclePanelResult:
+    data = json.loads(path.read_text())
+    per = {}
+    for f, d in data.items():
+        d.setdefault("cases", [])
+        per[f] = OracleResult(**d)
+    return OraclePanelResult(per_fixture=per)

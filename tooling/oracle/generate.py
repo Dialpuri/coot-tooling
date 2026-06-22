@@ -20,18 +20,18 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-from .runner import run_oracle
+from .runner import run_oracle, run_oracle_panel
 from ..db import connect, get_function
 from .render import build_oracle_prompt
-from .agent import generate_with_agent
+from .agent import generate_with_agent, _revision_section
 from .compile import write_compile_script, compile_oracle
-from .notes import extract_oracle_notes, save_notes
-from .coverage import compute_coverage, save_coverage, render_summary
-from .pdb_selector import select_pdb, catalog_note, structural_note, pdb_path as make_pdb_path
+from .notes import extract_oracle_notes, save_notes, summarise_behavior
+from .coverage import compute_coverage, save_coverage, render_summary, render_for_prompt
+from .pdb_selector import fixture_panel, pdb_path as make_pdb_path
 from ..ollama import generate_url
 
 OLLAMA_URL    = "http://localhost:11434/api/generate"  # kept for reference
-DEFAULT_MODEL = "qwen3.6"
+DEFAULT_MODEL = "hugginface/Qwen3.6-27B"
 OUT_ROOT      = Path(__file__).parent.parent.parent / "generated-tests"
 
 CRITIQUE_INSTRUCTIONS = """\
@@ -125,6 +125,71 @@ def critique_oracle(oracle_code: str, original_prompt: str, model: str) -> str |
     return extract_cpp(response)
 
 
+_REVISION_SNAPSHOT_FILES = (
+    "oracle.cc", "result.json", "panel.json", "coverage.json",
+    "agent_trace.txt", "prompt.txt",
+)
+
+
+def _has_mutation_blindspot(cov) -> bool:
+    """True when the oracle observed a mutation that came back unchanged for
+    every BEFORE/AFTER pair — the 'function did nothing' signal that usually
+    means the oracle watched an invariant (atom count) instead of the field the
+    function edits (coordinates, B-factors)."""
+    d = cov.dynamic
+    return d.n_before_after_pairs > 0 and d.n_identical_pairs == d.n_before_after_pairs
+
+
+def _restore_snapshot(oracle_out: Path, snapshot: dict[str, str | None]) -> None:
+    for name, content in snapshot.items():
+        if content is not None:
+            (oracle_out / name).write_text(content)
+
+
+def _attempt_coverage_revision(
+    conn, function_qname, sig_hash, model, oracle_out: Path,
+    prior_oracle: str, prior_cov, fn_src, verbose: bool,
+):
+    """One bounded re-run of the oracle agent with coverage feedback steering it
+    toward the right observable. Returns (oracle_code, panel, result, cov) of
+    the revised oracle if it scores strictly better; otherwise restores the
+    original artifacts and returns None."""
+    feedback = _revision_section(prior_oracle, render_for_prompt(prior_cov))
+    snapshot = {
+        name: (oracle_out / name).read_text() if (oracle_out / name).exists() else None
+        for name in _REVISION_SNAPSHOT_FILES
+    }
+
+    print(f"  [coverage] no-op mutation (score {prior_cov.score:.2f}) — "
+          "one revision attempt with observable guidance...")
+    new_code, _trace = generate_with_agent(
+        conn, function_qname, model,
+        oracle_out=oracle_out, verbose=verbose, sig_hash=sig_hash,
+        revision_feedback=feedback,
+    )
+    if not new_code:
+        _restore_snapshot(oracle_out, snapshot)
+        return None
+    (oracle_out / "oracle.cc").write_text(new_code)
+    write_compile_script(oracle_out)
+    compile_oracle(oracle_out)
+    panel = run_oracle_panel(oracle_out)
+    result = panel.primary()
+    if not panel.success or result is None:
+        _restore_snapshot(oracle_out, snapshot)
+        return None
+    cov = compute_coverage(fn_src["source_code"] if fn_src else "", result)
+    if cov.score > prior_cov.score:
+        save_coverage(cov, oracle_out / "coverage.json")
+        print(f"  [coverage] revision improved score "
+              f"{prior_cov.score:.2f} -> {cov.score:.2f}")
+        return new_code, panel, result, cov
+    print(f"  [coverage] revision did not improve "
+          f"({cov.score:.2f} <= {prior_cov.score:.2f}); keeping original")
+    _restore_snapshot(oracle_out, snapshot)
+    return None
+
+
 def generate_one(
     conn,
     function_qname: str,
@@ -147,26 +212,14 @@ def generate_one(
     oracle_out.mkdir(parents=True, exist_ok=True)
     oracle_cc_path = oracle_out / "oracle.cc"
 
-    # Select the most appropriate example PDB for this function.
-    fn_row = get_function(conn, function_qname, sig_hash)
-    pdb_file, pdb_certain = select_pdb(
-        function_qname,
-        source_code=fn_row["source_code"] or "" if fn_row else "",
-        doc_comment=fn_row["comment"] or "" if fn_row else "",
-    )
-    pdb_note = "" if pdb_certain else catalog_note(selected_file=pdb_file)
-    snote = structural_note(pdb_file)
-    if snote:
-        pdb_note = f"{pdb_note}\n{snote}".strip()
-    if pdb_certain:
-        print(f"[pdb] auto-selected {pdb_file} for {function_qname}")
-    else:
-        print(f"[pdb] using default {pdb_file} for {function_qname} (LLM may choose another)")
+    # No per-function structure selection: the oracle reads its path from argv
+    # and is verified across the whole fixture panel.
+    # print(f"[pdb] oracle runs across the {len(fixture_panel())}-fixture panel "
+        #   f"(generic navigation, no per-function structure)")
 
     oracle_code, trace = generate_with_agent(
         conn, function_qname, model,
         oracle_out=oracle_out, verbose=verbose,
-        pdb_file=pdb_file, pdb_note=pdb_note,
         sig_hash=sig_hash,
     )
     (oracle_out / "agent_trace.txt").write_text(trace)
@@ -183,12 +236,17 @@ def generate_one(
     write_compile_script(oracle_out)
     compile_oracle(oracle_out)
 
-    result = run_oracle(oracle_out)
-    print(result.summary())
+    # Run the oracle across the multi-fixture panel (protein / ligand / RNA /
+    # glycoprotein). Pass = at least one fixture produced observable output;
+    # the per-fixture (input, output) pairs become the frozen assertions the
+    # test stage checks, so a constant tuned to one structure can't pass.
+    panel = run_oracle_panel(oracle_out)
+    print(panel.summary())
+    result = panel.primary()   # primary passing fixture, for coverage/notes
 
     # Coverage signal — heuristic check that the oracle did something
     # interesting. Persist for the test/gemmi stages to read.
-    if result.success:
+    if panel.success and result is not None:
         try:
             fn_src = get_function(conn, function_qname, sig_hash)
             cov = compute_coverage(
@@ -199,14 +257,43 @@ def generate_one(
             print(f"  {render_summary(cov)}")
             for s in cov.signals:
                 print(f"  [coverage] {s}")
+            # Coverage-triggered revision: a no-op mutation almost always means
+            # the oracle watched the wrong field. Give the agent one guided
+            # retry, and adopt it only if it actually improves coverage. Updates
+            # oracle_code/result so the notes/behavior passes use the better one.
+            if _has_mutation_blindspot(cov):
+                revised = _attempt_coverage_revision(
+                    conn, function_qname, sig_hash, model, oracle_out,
+                    oracle_code, cov, fn_src, verbose,
+                )
+                if revised:
+                    oracle_code, panel, result, cov = revised
         except Exception as e:
             print(f"[coverage] skipped: {e}")
 
     # Extract structured notes from the working oracle for downstream stages.
     # Best-effort: a failure here should not fail oracle generation.
-    if result.success:
+    if panel.success:
         try:
             notes = extract_oracle_notes(oracle_code, function_qname, model)
+            # Behavior pass: document what the function does, grounded in the
+            # original source + the oracle's actual output. Separate call from
+            # the empirical notes pass (it interprets logic, they don't).
+            if result is not None:
+                try:
+                    fn_src = get_function(conn, function_qname, sig_hash)
+                    behavior = summarise_behavior(
+                        fn_src["source_code"] if fn_src else "",
+                        oracle_code,
+                        result.summary(),
+                        function_qname,
+                        model,
+                    )
+                    if behavior:
+                        notes = notes or {}
+                        notes["behavior"] = behavior
+                except Exception as e:
+                    print(f"[behavior] summary skipped: {e}")
             if notes:
                 save_notes(notes, oracle_out / "notes.json")
         except Exception as e:
@@ -223,7 +310,7 @@ def main() -> None:
                              "function is overloaded; defaults to the first overload "
                              "the DB returns otherwise.")
     parser.add_argument("--model",       default=DEFAULT_MODEL, help="Ollama model")
-    parser.add_argument("--backend",     default="ollama", choices=["ollama", "openai"],
+    parser.add_argument("--backend",     default="openai", choices=["ollama", "openai"],
                         help="LLM backend (default: ollama)")
     parser.add_argument("--no-thinking", action="store_true",
                         help="Disable reasoning/thinking output (sets CT_THINK=0)")
@@ -242,19 +329,7 @@ def main() -> None:
     conn = connect()
 
     if args.dry_run:
-        fn_row = get_function(conn, args.function, args.sig)
-        pdb_file, pdb_certain = select_pdb(
-            args.function,
-            source_code=fn_row["source_code"] or "" if fn_row else "",
-            doc_comment=fn_row["comment"] or "" if fn_row else "",
-        )
-        pdb_note = "" if pdb_certain else catalog_note(selected_file=pdb_file)
-        snote = structural_note(pdb_file)
-        if snote:
-            pdb_note = f"{pdb_note}\n{snote}".strip()
-        prompt = build_oracle_prompt(conn, args.function,
-                                     pdb_file=pdb_file, pdb_note=pdb_note,
-                                     sig_hash=args.sig)
+        prompt = build_oracle_prompt(conn, args.function, sig_hash=args.sig)
         conn.close()
         if prompt is None:
             print(f"Function not found in DB: {args.function}", file=sys.stderr)

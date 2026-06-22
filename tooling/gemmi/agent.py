@@ -68,7 +68,7 @@ from .compile import (
     MAX_COMPILE_ATTEMPTS, compile_gemmi, run_gemmi_test_binary,
     write_compile_script,
 )
-from .lint import gemmi_lint, lint_report
+from .lint import gemmi_lint, lint_report, coot_record_type_index
 from .name_check import name_check_report
 from .cheat_lookup import mmdb_to_gemmi, include_for_symbol
 from ..oracle.generate import OUT_ROOT, sanitize_name, find_function_dirs
@@ -597,6 +597,35 @@ def _check_assertions_unchanged(original_test_cc: str, proposed_test_cc: str) ->
     )
 
 
+def _check_fixtures_present(original_test_cc: str, proposed_test_cc: str) -> str | None:
+    """Warn if the gemmi test fails to load every fixture the MMDB test used.
+
+    The MMDB test now carries ONE TEST per panel fixture (protein / RNA / ligand
+    / …), each loading its own structure path and asserting that structure's
+    frozen values. The gemmi test must mirror that — load each fixture and assert
+    its values in the matching TEST — otherwise the per-fixture discrimination
+    (what defeats a hardcoded constant) is lost. Checking that every original
+    fixture PATH reappears in the gemmi test is a cheap structural proxy for that.
+    """
+    original = _extract_test_fixtures(original_test_cc)
+    if len(original) <= 1:
+        return None                      # single-fixture test — nothing to mirror
+    proposed = set(_extract_test_fixtures(proposed_test_cc))
+    missing = [p for p in original if p not in proposed]
+    if not missing:
+        return None
+    sample = "\n".join(f"  - {p}" for p in missing[:6])
+    return (
+        f"FIXTURE CHECK: the MMDB test exercises {len(original)} fixtures, but "
+        f"your test.cc does not load {len(missing)} of them:\n\n{sample}\n\n"
+        "Each fixture is a structurally-different structure with its OWN frozen "
+        "values. Mirror the MMDB test: write one TEST per fixture, load that "
+        "fixture's path with gemmi (read_structure / read_pdb_file), and assert "
+        "that fixture's values there. Do NOT collapse them into one TEST or drop "
+        "a fixture — the panel exists to catch a result hardcoded to one structure."
+    )
+
+
 GEMMI_CHEAT_SHEET = """\
 ## gemmi quick reference (verified against the installed headers)
 
@@ -636,6 +665,15 @@ Most-used MMDB → gemmi accessors (use the mmdb_to_gemmi tool with method="<Nam
   //     auto norm = [](const std::string& ic){ return ic.empty() ? std::string(" ") : ic; };
   //     if (norm(query_ic) == std::string(1, residue.seqid.icode)) { ... }
   atom->GetAtomName()             → atom.name               // std::string field
+  // ⚠ ATOM NAME PADDING MISMATCH: MMDB GetAtomName() returns the 4-char,
+  //   space-padded PDB field (" CA ", " N  ", and "CA  " for a calcium ion);
+  //   gemmi atom.name is UNPADDED/trimmed ("CA", "N"). If the oracle froze a
+  //   padded MMDB name, normalize before comparing — do NOT edit the literal:
+  //     auto unpad = [](std::string s){
+  //         size_t a = s.find_first_not_of(' ');
+  //         if (a == std::string::npos) return std::string();
+  //         return s.substr(a, s.find_last_not_of(' ') - a + 1); };
+  //     EXPECT_EQ(unpad(expected_padded_name), atom.name);
   atom->GetElementName()          → atom.element.name()     // "C","O" — unpadded
   atom->x, atom->y, atom->z       → atom.pos.x, atom.pos.y, atom.pos.z
   atom->occupancy                 → atom.occ
@@ -730,6 +768,8 @@ GEMMI_ANTIPATTERNS = """\
      → ✅ normalize: MMDB "" and gemmi ' ' both mean "no insertion code":
           auto norm=[](const std::string& s){ return s.empty() ? std::string(" ") : s; };
           norm(query_ic) == std::string(1, r.seqid.icode)
+  ❌ EXPECT_EQ(" CA ", atom.name)  // padded MMDB name vs unpadded gemmi atom.name
+     → ✅ unpad the frozen literal: EXPECT_EQ(unpad(" CA "), atom.name)  // "CA"=="CA"
   ❌ Atom.alt_loc                  → ✅ Atom.altloc   (no underscore)
   ❌ Structure.links               → ✅ Structure.connections
   ❌ Structure.space_group         → ✅ Structure.spacegroup_hm
@@ -815,6 +855,14 @@ You MAY rewrite the accessor on the LHS of an assertion when the type changes:
 You MAY NOT change the expected value or weaken the comparison operator.
 `42` stays `42`. `EXPECT_EQ` does not become `EXPECT_NEAR`. The original
 expected literals are the correctness oracle.
+
+You MUST preserve the test's PER-FIXTURE STRUCTURE. When the MMDB test has
+several `TEST(...)` blocks — one per fixture structure, each loading a different
+path — reproduce all of them: one gemmi TEST per fixture, each loading that
+fixture's structure and asserting that fixture's own values. The fixtures are
+structurally different (protein / RNA / ligand / glycoprotein) so their expected
+values differ; that is deliberate (a port hardcoded to one structure fails the
+others). Do not merge fixtures or drop one.
 
 # Function port
 - Semantics 1:1 — same output for the same input.
@@ -1370,13 +1418,16 @@ def _make_tool_handlers(
         # Pre-flight gemmi anti-pattern lint — also a free fix cycle. Catches
         # the recurring mistakes that would otherwise burn a compile attempt
         # (Real3, alt_loc, st.setup_entities(), missing <gtest/gtest.h>, etc).
+        # The real-coot-type redefinition rule needs the DB type index; build it
+        # once per gate when a connection is available (older callers pass none).
+        coot_types = coot_record_type_index(conn) if conn is not None else None
         lint_sections: list[str] = []
         for label, body in (("function.hh", function_hh),
                             ("function.cc", function_cc),
                             ("test.cc",     test_cc)):
             if not body:
                 continue
-            findings = gemmi_lint(body)
+            findings = gemmi_lint(body, coot_types)
             if findings:
                 lint_sections.append(
                     f"--- {label} ---\n" + "\n".join(f"  - {f}" for f in findings)
@@ -1462,6 +1513,10 @@ def _make_tool_handlers(
 
         compile_log = gemmi_subdir / "compile.log"
         compile_log.write_text(output)
+        # Snapshot the full log next to the draft sources it belongs to, sharing
+        # this attempt's sequence number so a draft can be reviewed with the
+        # exact compiler output it produced.
+        (gemmi_subdir / "drafts" / f"{draft_seq[0]:03d}_compile.log").write_text(output)
         # Pull name-resolution hints from the FULL log before truncation, so a
         # `did you mean 'coot::X'?` note buried in the middle isn't elided.
         suggestion = _compiler_suggestion_directive(output)
@@ -1470,6 +1525,9 @@ def _make_tool_handlers(
             last_binary[0] = test_bin
             run_ok, run_out = run_gemmi_test_binary(test_bin)
             (gemmi_subdir / "run.log").write_text(run_out)
+            # Snapshot the run output next to this attempt's draft sources,
+            # sharing the compile log's sequence number.
+            (gemmi_subdir / "drafts" / f"{draft_seq[0]:03d}_run.log").write_text(run_out)
             run_lines = run_out.splitlines()
             if len(run_lines) > 100:
                 run_out = "\n".join(run_lines[:100]) + f"\n... ({len(run_lines) - 100} more lines)"
@@ -1537,15 +1595,16 @@ def _make_tool_handlers(
             # accepted, and we don't want to badger the model after one nudge.
             assertion_warning = ""
             if original_test_cc and not assertion_warned[0]:
-                violation = _check_assertions_unchanged(
-                    original_test_cc, tc.read_text()
-                )
-                if violation:
+                proposed = tc.read_text()
+                violation = _check_assertions_unchanged(original_test_cc, proposed)
+                fixture_violation = _check_fixtures_present(original_test_cc, proposed)
+                if violation or fixture_violation:
                     assertion_warned[0] = True
-                    assertion_warning = (
-                        "\n\n⚠ ASSERTION CHECK (one-time notice).\n"
-                        + violation
-                    )
+                    assertion_warning = "\n\n⚠ TEST CHECK (one-time notice)."
+                    if fixture_violation:
+                        assertion_warning += "\n" + fixture_violation
+                    if violation:
+                        assertion_warning += "\n" + violation
             return (
                 f"'{filename}' written. Compilation triggered automatically:"
                 f"\n\n{result}{assertion_warning}"
@@ -1860,6 +1919,18 @@ def generate_gemmi_port_with_agent(
             "do NOT call grep_codebase to verify them)"
         )
         parts.append("\n".join(f"  - {p}" for p in fixtures))
+        if len(fixtures) > 1:
+            parts.append(
+                f"**MULTI-FIXTURE: the MMDB test has one TEST per fixture "
+                f"({len(fixtures)} of them), each loading a DIFFERENT structure "
+                "and asserting THAT structure's own frozen values. Mirror this "
+                "exactly: produce one gemmi `TEST(...)` per fixture, load that "
+                "fixture's path with `gemmi::read_structure(path)` (auto-detects "
+                "pdb/cif), and assert that fixture's values in its TEST. The "
+                "expected literals differ between fixtures — never reuse one "
+                "fixture's numbers for another, and never collapse them into a "
+                "single TEST. All per-fixture TESTs must pass.**"
+            )
 
     # Pre-fill the gtest preamble so the agent stops grep'ing for it. Real
     # data: 25+ wasted grep_codebase calls per failed run looking for gtest.h.
@@ -2307,14 +2378,20 @@ def generate_gemmi_port_with_agent(
     # are valid ports and a strict reject loses good work. The warning is
     # written to the trace so it can be reviewed after the fact.
     if final_blocks and original_test_cc:
-        violation = _check_assertions_unchanged(
-            original_test_cc, final_blocks.get("test.cc", "")
-        )
+        proposed_test = final_blocks.get("test.cc", "")
+        violation = _check_assertions_unchanged(original_test_cc, proposed_test)
         if violation:
             trace_lines.append(
                 f"[agent] Final assertion check WARNING (output kept — verify "
                 f"RHS is semantically equivalent).\n"
                 f"{textwrap.indent(violation, '  ')}\n"
+            )
+        fixture_violation = _check_fixtures_present(original_test_cc, proposed_test)
+        if fixture_violation:
+            trace_lines.append(
+                f"[agent] Final fixture check WARNING (output kept — multi-fixture "
+                f"coverage may be incomplete).\n"
+                f"{textwrap.indent(fixture_violation, '  ')}\n"
             )
 
     text = trace_lines.text()

@@ -83,6 +83,31 @@ def _load_oracle_result(oracle_dir: Path) -> OracleResult:
     return result
 
 
+def _load_fixtures(oracle_dir: Path) -> list:
+    """Per-fixture frozen ground truth from the oracle's panel.json.
+
+    Returns FixtureCase entries for fixtures that produced output. Empty when
+    the oracle predates multi-fixture (no panel.json) — the caller then falls
+    back to the single-fixture (result.json) prompt.
+    """
+    from ..oracle.runner.results import load_panel_result
+    from ..oracle.pdb_selector import TEST_DATA_DIR, paired_mtz
+    from .agent import FixtureCase
+
+    panel_path = oracle_dir / "oracle" / "panel.json"
+    if not panel_path.exists():
+        return []
+    panel = load_panel_result(panel_path)
+    fixtures: list = []
+    for name, res in panel.per_fixture.items():
+        if res.success and res.outputs:
+            fixtures.append(FixtureCase(
+                name=name, path=str(TEST_DATA_DIR / name),
+                mtz=paired_mtz(name), result=res,
+            ))
+    return fixtures
+
+
 def _write_test_files(oracle_dir: Path, test_src: str) -> Path:
     test_subdir = oracle_dir / "test"
     test_subdir.mkdir(exist_ok=True)
@@ -139,11 +164,17 @@ def generate_test(
         oracle_trace_path = oracle_subdir / "agent_trace.txt"
         oracle_trace = oracle_trace_path.read_text() if oracle_trace_path.exists() else None
 
+        fixtures = _load_fixtures(oracle_dir)
+        if fixtures:
+            print(f"[test] multi-fixture: freezing {len(fixtures)} fixture(s): "
+                  f"{', '.join(fx.name for fx in fixtures)}")
+
         try:
             test_src, trace = generate_test_with_agent(
                 _conn, oracle_cc.read_text(), result,
                 test_subdir=test_subdir, model=model,
                 oracle_trace=oracle_trace, verbose=verbose,
+                fixtures=fixtures or None,
             )
         finally:
             if conn is None:

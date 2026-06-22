@@ -44,6 +44,103 @@ from ..oracle.render import construction_overrides_for_function
 from ..oracle.notes import load_notes, render_notes_for_prompt
 from ..oracle.coverage import load_coverage, render_for_prompt as render_coverage_for_prompt
 from ..oracle.runner.results import OracleResult
+from dataclasses import dataclass
+
+
+@dataclass
+class FixtureCase:
+    """One panel fixture's frozen ground truth for the test stage."""
+    name: str               # basename, e.g. "example-na.pdb"
+    path: str               # absolute path to hardcode in that fixture's TEST
+    mtz: str | None         # paired map path, or None
+    result: OracleResult    # the oracle's observed INPUT/OUTPUT on this fixture
+
+
+def _fixture_tag(name: str) -> str:
+    """A gtest-safe suffix for a fixture name, e.g. example-na.pdb -> example_na_pdb."""
+    return re.sub(r"[^A-Za-z0-9]", "_", name).strip("_")
+
+
+# Library/setup banner lines the oracle prints on every run (CCP4 monomer
+# dictionary load). They carry no ground truth and, multiplied across the
+# 6-fixture panel, can dwarf the real INPUT/OUTPUT — a get_*_as_json oracle
+# emits ~20k lines / 600 kB *per fixture*, blowing the prompt past the context
+# window so the test never generates.
+_NOISE_PREFIXES = (
+    "INFO::", "INFO:", "WARNING::", "WARNING:", "Using ", "There are ",
+    "debug::", "DEBUG::",
+)
+
+
+def _looks_like_noise(line: str) -> bool:
+    return line.lstrip().startswith(_NOISE_PREFIXES)
+
+
+def summarize_oracle_stdout(
+    stdout: str,
+    max_block_lines: int = 40,
+    head_lines: int = 25,
+    tail_lines: int = 8,
+    max_line_chars: int = 400,
+) -> str:
+    """Compress an oracle's raw stdout for embedding in a prompt.
+
+    Handles the two bloat sources: (1) the CCP4 monomer-library banner, dropped
+    wholesale; (2) huge multi-line OUTPUT values (e.g. a ~600 kB get_*_as_json
+    dump), collapsed to head+tail with the elided middle marked. The companion
+    `OUTPUT <key>_length:` line the oracle prints is short and survives intact,
+    so the test still has the exact size to assert a range on plus landmark
+    tokens from the head — exactly what the 'large strings' rule needs (size +
+    substring, never the full value).
+    """
+    def _is_header(s: str) -> bool:
+        t = s.lstrip()
+        return t.startswith("INPUT ") or t.startswith("OUTPUT ") or \
+            t.startswith("INPUT\t") or t.startswith("OUTPUT\t")
+
+    kept: list[str] = []
+    noise = 0
+    for ln in stdout.splitlines():
+        if _looks_like_noise(ln):
+            noise += 1
+            continue
+        if len(ln) > max_line_chars:
+            ln = ln[:max_line_chars] + f" …[+{len(ln) - max_line_chars} chars]"
+        kept.append(ln)
+    if noise:
+        kept.insert(0, f"[{noise} library/info banner line(s) hidden]")
+
+    out: list[str] = []
+    i, n = 0, len(kept)
+    while i < n:
+        block = [kept[i]]
+        j = i + 1
+        while j < n and not _is_header(kept[j]):
+            block.append(kept[j])
+            j += 1
+        if len(block) > max_block_lines:
+            elided = len(block) - head_lines - tail_lines
+            out.extend(block[:head_lines])
+            out.append(f"... [{elided} line(s) elided to fit context — assert on "
+                       f"the OUTPUT *_length value + landmark substrings, not the "
+                       f"full dump] ...")
+            out.extend(block[-tail_lines:])
+        else:
+            out.extend(block)
+        i = j
+    return "\n".join(out)
+
+
+def render_fixture_blocks(fixtures: list[FixtureCase]) -> str:
+    """Per-fixture observed-output sections — the distinct frozen values."""
+    blocks: list[str] = []
+    for fx in fixtures:
+        header = (f"### Fixture `{fx.name}`  (TEST tag: `{_fixture_tag(fx.name)}`)\n"
+                  f"Path to hardcode: `{fx.path}`"
+                  + (f"   MTZ: `{fx.mtz}`" if fx.mtz else ""))
+        body = summarize_oracle_stdout(fx.result.stdout.rstrip())
+        blocks.append(f"{header}\n```\n{body}\n```")
+    return "\n\n".join(blocks)
 from .compile import MAX_COMPILE_ATTEMPTS, compile_test_cc, run_test_binary
 
 TEST_SYSTEM_PROMPT = """\
@@ -55,16 +152,26 @@ answers. NEVER edit an expected literal to make a failing test pass — if
 an assertion fails, the bug is in your setup or accessor, not the
 expected value. Fix the test, not the oracle.
 
-# Structure
-1. Copy the oracle's setup (PDB/MTZ load, object construction, the call
-   itself) verbatim. The only changes from oracle.cc are: remove the
-   INPUT/OUTPUT cout lines, add assertions in their place.
-2. Wrap ALL cases from the oracle in ONE block:
-       TEST(OracleTest, <FunctionName>) { ... }
-   Use inner `{ ... }` scopes (or a `// case: edge` comment) to label
-   each case. Single TEST block keeps the binary small and makes
-   diffing against the gemmi test trivial — do not split into multiple
-   TESTs.
+# Structure — ONE TEST per fixture (multi-fixture freezing)
+The oracle was run across a PANEL of structurally-different structures
+(protein, protein+H, ligand-only, protein-ligand, RNA, glycoprotein). Each
+fixture that applied produced its OWN observed values, listed separately below.
+
+1. Copy the oracle's setup (structure load, object construction, the call, the
+   generic runtime navigation) — but the oracle read its path from argv[1]; in
+   the test, HARDCODE each fixture's own path. Remove the INPUT/OUTPUT cout
+   lines and put assertions in their place.
+2. Write ONE TEST per fixture that produced output:
+       TEST(OracleTest, <FunctionName>_<fixture_tag>) { ... }
+   e.g. `<FunctionName>_example_na_pdb`. Each TEST loads THAT fixture's path,
+   navigates generically exactly as the oracle did, calls the function, and
+   asserts THAT fixture's frozen values. Use inner `{ }` scopes to label the
+   oracle's sub-cases within a fixture.
+   * The expected literals DIFFER between fixtures — that is the whole point:
+     a value observed on one structure must NOT be reused for another. Use each
+     fixture's own observed values, exactly as printed in ITS block below.
+   * Only write TESTs for fixtures that actually produced output. Do not invent
+     a TEST (or fabricate values) for a fixture the oracle dropped.
 3. Normally do NOT write `main()` — gtest_main is linked and provides one.
    EXCEPTION: if any test constructs a `molecules_container_t` (or another
    object with heavy global/static state), its destructor can double-free
@@ -365,6 +472,7 @@ def generate_test_with_agent(
     model: str,
     oracle_trace: str | None = None,
     verbose: bool = False,
+    fixtures: list[FixtureCase] | None = None,
 ) -> tuple[str | None, str]:
     """Run the agentic test generation loop.
 
@@ -420,9 +528,20 @@ def generate_test_with_agent(
     parts.append("## Oracle program")
     parts.append(f"```cpp\n{oracle_cc_text.rstrip()}\n```")
 
-    parts.append("## Observed output when run")
-    parts.append("_INPUT/OUTPUT lines are the ground truth; ignore any leading warnings._")
-    parts.append(f"```\n{oracle_result.stdout.rstrip()}\n```")
+    if fixtures:
+        parts.append("## Observed output PER FIXTURE — write one TEST per fixture")
+        parts.append(
+            "_The oracle ran across the panel below; each fixture produced its own "
+            "ground-truth INPUT/OUTPUT. Freeze each fixture's values in its own "
+            f"TEST(OracleTest, <Fn>_<tag>), hardcoding that fixture's path. There "
+            f"are {len(fixtures)} fixtures — expect the literals to differ between "
+            "them. Ignore any leading warnings in each block._"
+        )
+        parts.append(render_fixture_blocks(fixtures))
+    else:
+        parts.append("## Observed output when run")
+        parts.append("_INPUT/OUTPUT lines are the ground truth; ignore any leading warnings._")
+        parts.append(f"```\n{summarize_oracle_stdout(oracle_result.stdout.rstrip())}\n```")
 
     # Compact oracle trace summary (tool calls only)
     # if oracle_trace:

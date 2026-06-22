@@ -215,32 +215,59 @@ def loop_guard_intercept(
 NOTES_DIR        = Path(__file__).parent / "notes"
 ANSWER_MARKER    = "## Answer"
 TEST_DATA_DIR    = Path(__file__).parent.parent.parent / "test-data"
+
+from .pdb_selector import DEFAULT_FIXTURE
 GENERATED_TEST_DIR    = Path(__file__).parent.parent.parent / "generated-tests"
 THIRD_PARTY_INCLUDE = str(Path(__file__).parent.parent.parent / "third-party" / "google-test" / "include")
 
 # Paths the model is allowed to read.
 ALLOWED_READ_ROOTS = [PROJECT_ROOT] + INCLUDE_ROOTS + [str(TEST_DATA_DIR), THIRD_PARTY_INCLUDE, str(GENERATED_TEST_DIR)]
 
-def make_agent_system_prompt(pdb_path: str, pdb_note: str = "") -> str:
-    """Build the agent system prompt with the given PDB path.
+def make_agent_system_prompt() -> str:
+    """Build the agent system prompt.
 
-    pdb_note is injected after the PDB line when the file choice was ambiguous —
-    it lists all available PDB files so the LLM can pick a more appropriate one.
+    No per-function structure is selected: the oracle reads its path from argv
+    and is verified across the whole fixture panel (shown in the task context).
+    A fixed default is baked in only as the argc<2 hand-run fallback.
     """
-    pdb_section = f"PDB: {pdb_path}"
-    if pdb_note:
-        pdb_section += (
-            "\n(The path above is a default — if the listed alternatives suit "
-            f"the function better, use one of them instead.)\n{pdb_note}"
-        )
+    pdb_path = str(TEST_DATA_DIR / DEFAULT_FIXTURE)
+    pdb_section = (
+        "The structure comes from argv[1] — the harness runs your program across "
+        "the whole FIXTURE PANEL listed in the task context. The path below is "
+        "ONLY the argc<2 hand-run fallback, not a structure to assume."
+    )
     return f"""\
-You are writing oracle.cc — a self-contained C++ program that calls ONE
-function and prints its inputs and outputs to stdout in a fixed format.
+You are writing oracle.cc — a C++ program that calls ONE function and prints its
+inputs and outputs to stdout in a fixed format. It is run REPEATEDLY across a
+panel of structurally-different structures (protein, RNA, ligand-only,
+glycoprotein), so it must NOT hardcode a path or a structure-specific residue.
+
+# Input contract (READ THIS — it is the most important rule)
+The program receives the structure file as argv[1] and an optional MTZ map as
+argv[2]. It is invoked once per fixture by the harness:
+
+    ./oracle <structure-path> [<mtz-path>]
+
+  * Read the structure path from argv[1]. Provide a sensible default
+    (`{pdb_path}`) when argc < 2 so the binary is still runnable by hand.
+  * `molecules_container_t::read_pdb` reads BOTH .pdb and .mmcif/.cif coordinate
+    files. A fixture that doesn't load (e.g. a ligand-only restraint .cif when
+    you need coordinates) should make the program exit non-zero — that fixture
+    is intentionally dropped by the harness, NOT faked.
+  * If a fixture doesn't load, try calling set_use_gemmi(false) on your molecules_container_t instance.
+
+# Generic navigation (do NOT hardcode `//A/10/CA`)
+The same binary must reach a valid receiver on EVERY structure, which have
+different chains/residues. Derive your inputs from whatever is loaded at runtime:
+pick the first model, the first chain, the first residue (of the kind the
+function needs), the first atom — and BUILD any CID/spec from those, e.g. a CID
+from the chosen residue's chain name + seqid. Never assume chain "A" residue 10
+exists.
 
 # Test data
 {pdb_section}
-MTZ: {TEST_DATA_DIR}/example.mtz   (load this ONLY if the target function
-                                    reads map/reflection data)
+(argv[2] receives the paired MTZ when one exists — load it ONLY if the target
+function reads map/reflection data.)
 
 # Required output format
 For every input passed to the function and every meaningful output, print
@@ -255,26 +282,36 @@ Example (real working oracle for `coot::molecule_t::cid_to_atom`):
     #include "api/coot-molecule.hh"
     #include "api/molecules-container.hh"
 
-    int main() {{
+    int main(int argc, char **argv) {{
+        std::string structure_path = argc > 1 ? argv[1] : "{pdb_path}";
         molecules_container_t mc;
-        int imol = mc.read_pdb("{pdb_path}");
-        if (imol < 0) {{ std::cerr << "load failed\\n"; return 1; }}
+        mc.set_use_gemmi(false); 
+        int imol = mc.read_pdb(structure_path);
+        if (imol < 0) {{ std::cerr << "load failed: " << structure_path << "\\n"; return 1; }}
+        auto &mol = mc[imol];
 
-        // case 1: valid atom
+        // Navigate GENERICALLY: find the first residue, build a CID from it.
+        mmdb::Manager *m = mol.atom_sel.mol;
+        mmdb::Residue *res = m->GetResidue(0, 0, 0);   // model 0, chain 0, res 0
+        if (!res) {{ std::cerr << "no residue\\n"; return 1; }}
+        std::string chain_id = res->GetChainID();
+        int resno = res->GetSeqNum();
+        std::string cid = "//" + chain_id + "/" + std::to_string(resno) + "/CA";
+
+        // case 1: the first residue's CA (valid on any structure with one)
         {{
-            std::string cid = "//A/10/CA";
-            mmdb::Atom *atom = mc[imol].cid_to_atom(cid);
+            mmdb::Atom *atom = mol.cid_to_atom(cid);
             std::cout << "INPUT  cid: " << cid << std::endl;
             std::cout << "OUTPUT atom_found: " << (atom ? "true" : "false") << std::endl;
             std::cout << "OUTPUT atom_name: "
                       << (atom ? atom->GetAtomName() : "nullptr") << std::endl;
         }}
 
-        // case 2: invalid CID — verifies the guarded path
+        // case 2: a deliberately-invalid CID — verifies the guarded path
         {{
-            std::string cid = "//A/9999/N";
-            mmdb::Atom *atom = mc[imol].cid_to_atom(cid);
-            std::cout << "INPUT  cid: " << cid << std::endl;
+            std::string bad = "//" + chain_id + "/999999/N";
+            mmdb::Atom *atom = mol.cid_to_atom(bad);
+            std::cout << "INPUT  cid: " << bad << std::endl;
             std::cout << "OUTPUT atom_found: " << (atom ? "true" : "false") << std::endl;
         }}
         return 0;
@@ -282,7 +319,8 @@ Example (real working oracle for `coot::molecule_t::cid_to_atom`):
 
 Cover 2–3 cases (typical + edge) using this pattern. Adapt the receiver
 construction to your target function — `molecules_container_t` + `mc[imol]`
-is the standard entry point for `coot::molecule_t` methods.
+is the standard entry point for `coot::molecule_t` methods. Keep navigation
+runtime-derived so every panel fixture is exercised.
 
 # Proving the function actually ran (read this carefully)
 Before you write code, read the function source and identify what it
@@ -364,7 +402,7 @@ itself returns them).\
 
 
 # Backward-compat constant — used by code that imports AGENT_SYSTEM_PROMPT directly.
-AGENT_SYSTEM_PROMPT = make_agent_system_prompt(str(TEST_DATA_DIR / "example.pdb"))
+AGENT_SYSTEM_PROMPT = make_agent_system_prompt()
 
 _MAX_COMPILE_ATTEMPTS = 20
 _EXTENSION_TURNS = 20
@@ -643,9 +681,12 @@ TOOLS: list[dict] = [
         "function": {
             "name": "inspect_pdb",
             "description": (
-                "Report what's actually in the selected test PDB: chain IDs, "
-                "residue ranges per chain, residue types, and a sample of atom names. "
-                "Use this to pick valid inputs (CIDs, chain IDs, residue numbers) "
+                "Report what's actually in a test structure: chain IDs, residue "
+                "ranges per chain, residue types, and a sample of atom names. Use "
+                "this to write navigation that works on EVERY panel fixture — the "
+                "oracle is run across all of them, so inspect each structure you "
+                "need to handle (e.g. the protein AND the RNA) rather than "
+                "assuming they look alike. Pick valid inputs from what you see "
                 "instead of guessing."
             ),
             "parameters": {
@@ -654,6 +695,17 @@ TOOLS: list[dict] = [
                     "chain": {
                         "type": "string",
                         "description": "Optional chain ID. If given, lists every residue in that chain.",
+                    },
+                    "fixture": {
+                        "type": "string",
+                        "description": (
+                            "Which panel structure to inspect (basename, e.g. "
+                            "'example-na.pdb'). Omit to inspect the prompt's "
+                            "example structure. Panel: example.pdb, "
+                            "example-hydrogen.pdb, example-ligand.cif, "
+                            "example-protein-ligand.cif, example-na.pdb, "
+                            "example-glycosylated.cif."
+                        ),
                     },
                 },
                 "required": [],
@@ -1674,13 +1726,29 @@ def _inspect_cif(
     return "\n".join(lines)
 
 
-def _tool_inspect_pdb(chain: str | None = None, pdb_path: Path | None = None) -> str:
-    """Parse the selected example PDB/CIF and summarise its contents.
+def _tool_inspect_pdb(
+    chain: str | None = None,
+    pdb_path: Path | None = None,
+    fixture: str | None = None,
+) -> str:
+    """Parse a panel PDB/CIF fixture and summarise its contents.
 
     Without 'chain': list chain IDs, residue count, and residue range per chain.
     With 'chain': list every (seq_num, ins_code, res_name) in that chain plus
     a sample of atom names.
+
+    'fixture' selects WHICH structure to inspect (a basename from the panel,
+    e.g. "example-na.pdb"); the oracle is verified across all of them, so the
+    agent must be able to inspect each to write navigation that works on every
+    one. Defaults to `pdb_path` (the prompt's example structure) when omitted.
     """
+    from .pdb_selector import FIXTURE_PANEL
+    if fixture is not None:
+        base = Path(fixture).name
+        if base not in FIXTURE_PANEL:
+            return (f"ERROR: '{fixture}' is not a panel fixture. Choose one of: "
+                    + ", ".join(FIXTURE_PANEL))
+        pdb_path = TEST_DATA_DIR / base
     if pdb_path is None:
         pdb_path = TEST_DATA_DIR / "example.pdb"
     if not pdb_path.exists():
@@ -1933,48 +2001,62 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
     def run_handler() -> str:
         if last_binary[0] is None:
             return "No compiled binary available — call compile_oracle first."
-        try:
-            proc = subprocess.run(
-                [str(last_binary[0].absolute())],
-                capture_output=True, cwd=str(oracle_out),
-                timeout=20,
+        from .runner import run_binary as _run_binary
+        from .pdb_selector import fixture_panel
+
+        binary = last_binary[0]
+        panel = fixture_panel()
+        per_fixture: list[tuple[str, int, str, bool]] = []  # name, rc, output, has_out
+        for structure_path, mtz_path in panel:
+            name = Path(structure_path).name
+            rc, stdout, stderr = _run_binary(
+                binary, args=[structure_path, mtz_path or ""], cwd=oracle_out,
             )
-        except subprocess.TimeoutExpired as exc:
-            partial = (exc.stdout or b"") + (exc.stderr or b"")
-            if isinstance(partial, bytes):
-                partial = partial.decode(errors="replace")
-            return (
-                "FAILED (timed out after 20s — the binary did not exit). "
-                "Likely an infinite loop or a blocking call. Partial output:\n"
-                + partial[-2000:]
-            )
-        stdout = proc.stdout.decode(errors="replace") if proc.stdout else ""
-        stderr = proc.stderr.decode(errors="replace") if proc.stderr else ""
-        output = (stdout + stderr).strip()
-        lines = output.splitlines()
-        if len(lines) > 100:
-            output = "\n".join(lines[:100]) + f"\n... ({len(lines) - 100} more lines)"
-        status = "OK" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
-        result = f"{status}\n{output}"
-        has_output_lines = any(l.startswith("OUTPUT") for l in lines)
-        if proc.returncode == 0 and not has_output_lines:
+            out = (stdout + stderr).strip()
+            has_out = any(l.startswith("OUTPUT") for l in out.splitlines())
+            per_fixture.append((name, rc, out, has_out))
+
+        n_pass = sum(1 for _, rc, _, h in per_fixture if rc == 0 and h)
+        header = (f"PANEL: {n_pass}/{len(per_fixture)} fixture(s) produced output "
+                  f"(the binary is run once per fixture with the path as argv[1]).")
+        lines_out = [header, ""]
+        for name, rc, _, has_out in per_fixture:
+            mark = "ok " if (rc == 0 and has_out) else "—  "
+            detail = "OK" if rc == 0 else f"exit {rc}"
+            if rc == 0 and not has_out:
+                detail += ", no OUTPUT"
+            lines_out.append(f"  [{mark}] {name}: {detail}")
+
+        # Show the first passing fixture's full output so the agent sees the
+        # actual INPUT/OUTPUT it produced; else the first fixture's output.
+        show = next((p for p in per_fixture if p[1] == 0 and p[3]), per_fixture[0])
+        name, rc, output, has_out = show
+        olines = output.splitlines()
+        if len(olines) > 100:
+            output = "\n".join(olines[:100]) + f"\n... ({len(olines) - 100} more lines)"
+        lines_out += ["", f"--- output for {name} ---", output]
+        result = "\n".join(lines_out)
+
+        if n_pass == 0:
             result += (
-                "\n\nWARNING: no OUTPUT lines detected. The function ran but "
-                "produced no observable output — it likely returned early or its "
-                "core logic was never reached. Re-read the function source, "
-                "identify what conditions are needed to reach the main body, "
-                "set up those inputs, add OUTPUT prints that capture the side "
-                "effects, and call compile_oracle again."
+                "\n\nWARNING: NO fixture produced OUTPUT. Either the function "
+                "returned early on every structure (preconditions not met), or "
+                "your navigation/prints are wrong. Re-read the source, derive "
+                "valid inputs at runtime (first chain/residue/atom), reach the "
+                "core logic, and add OUTPUT prints. Do NOT hardcode a constant "
+                "to make it pass — the function is run across multiple structures "
+                "precisely to catch that."
             )
-        # Soft advisory on any failure signal (crash, no output, or an obvious
-        # empty-dictionary sentinel): an uninitialised protein_geometry is a
-        # frequent silent cause. Never blocks — just points at a likely fix.
-        suspicious = (
-            proc.returncode != 0
-            or not has_output_lines
-            or "XXXXXX" in output
-            or "Cache is empty" in output
-        )
+        elif n_pass < len(per_fixture):
+            result += (
+                "\n\nNOTE: some fixtures produced no output. That is EXPECTED when "
+                "the function genuinely doesn't apply to that structure (e.g. a "
+                "protein-only function on the ligand-only .cif) — those are dropped. "
+                "But if a fixture you'd expect to work failed, your navigation may "
+                "be hardcoded to one structure's chains/residues — derive them at "
+                "runtime instead."
+            )
+        suspicious = n_pass == 0 or "XXXXXX" in output or "Cache is empty" in output
         if suspicious:
             for advisory in code_advisories(last_good_src[0] or ""):
                 result += "\n\n" + advisory
@@ -2046,7 +2128,9 @@ def _dispatch(
     if name == "grep_codebase":
         return _tool_grep_codebase(args["pattern"], args.get("glob"))
     if name == "inspect_pdb":
-        return _tool_inspect_pdb(args.get("chain"), pdb_path=pdb_path)
+        return _tool_inspect_pdb(
+            args.get("chain"), pdb_path=pdb_path, fixture=args.get("fixture"),
+        )
     if name == "get_base_classes":
         return _tool_get_base_classes(conn, args["name"])
     if name == "find_symbol":
@@ -2070,15 +2154,52 @@ def _dispatch(
 
 # ── agent loop ────────────────────────────────────────────────────────────────
 
+# Guidance injected on a coverage-triggered revision when the oracle observed a
+# mutation that looked like a no-op (BEFORE == AFTER). Almost always the oracle
+# watched an invariant (atom/residue COUNT) instead of the field the function
+# actually edits. Steer it to the right observable.
+MOLECULE_OBSERVABLE_GUIDANCE = """\
+When a function mutates a molecule in place, the meaningful observable is the
+data it EDITS — not the atom or residue COUNT, which stays constant under
+coordinate edits and makes the function look like it did nothing.
+
+Pick the observable from what the function corrects:
+  - moves / flips / refines atoms   -> print atom coordinates (x, y, z) of the
+                                       affected residue BEFORE and AFTER
+  - adjusts B-factors / occupancy   -> print those values before and after
+  - edits one residue / chain       -> identify it by chain + seqnum and print
+                                       ONLY its atoms, so the change isn't
+                                       diluted by thousands of unchanged atoms
+Print enough precision (e.g. printf("%.3f")) that a real change is visible.
+A non-trivial BEFORE != AFTER on the field the function corrects is the point."""
+
+
+def _revision_section(prior_oracle: str, coverage_feedback: str) -> str:
+    """Build the prompt section appended when re-running the agent to fix a
+    coverage weakness. Includes the prior oracle so the agent revises instead
+    of starting blind."""
+    return (
+        "## REVISION REQUESTED — your previous oracle under-observed the function\n\n"
+        "Your previous oracle.cc compiled and ran, but a coverage check found a "
+        "problem with WHAT it observed:\n\n"
+        f"```\n{coverage_feedback.rstrip()}\n```\n\n"
+        "Previous oracle.cc:\n"
+        f"```cpp\n{prior_oracle.rstrip()}\n```\n\n"
+        f"{MOLECULE_OBSERVABLE_GUIDANCE}\n\n"
+        "Produce a corrected oracle.cc that observes the value(s) the function "
+        "actually changes. Keep everything that already worked; only fix the "
+        "observation."
+    )
+
+
 def generate_with_agent(
     conn: sqlite3.Connection,
     function_qname: str,
     model: str,
     oracle_out: Path | None = None,
     verbose: bool = False,
-    pdb_file: str = "example.pdb",
-    pdb_note: str = "",
     sig_hash: str | None = None,
+    revision_feedback: str | None = None,
 ) -> tuple[str | None, str]:
     """Run the agentic oracle generation loop.
 
@@ -2086,9 +2207,8 @@ def generate_with_agent(
     oracle_code is None if the function wasn't found or the model produced nothing.
     trace_text is a human-readable log of every tool call and result.
 
-    pdb_file: filename (relative to test-data/) of the example PDB to use.
-    pdb_note: injected into the prompt when the choice was ambiguous, listing
-              all available PDB files so the LLM can choose.
+    The oracle is verified across the whole fixture panel; no per-function
+    structure is chosen. A fixed DEFAULT_FIXTURE is the argc<2 hand-run fallback.
     sig_hash: when `function_qname` is overloaded, pins which overload to
               target. None falls back to whichever overload sqlite returns.
     """
@@ -2165,7 +2285,9 @@ def generate_with_agent(
         parts.append(f"```\n{notes_context.rstrip()}\n```")
 
     # Attach the curated construction snippet for the containing class if one exists.
-    selected_pdb_path = TEST_DATA_DIR / pdb_file
+    # Construction overrides bake in a path; use the fixed hand-run default —
+    # the agent rewrites it to read argv[1] anyway (generic-navigation contract).
+    selected_pdb_path = TEST_DATA_DIR / DEFAULT_FIXTURE
     if target_class:
         override = _load_override(target_class, pdb_path=str(selected_pdb_path))
         if override:
@@ -2183,9 +2305,14 @@ def generate_with_agent(
         parts.append(f"## How to construct `{dep_qname}` (curated)")
         parts.append(f"```cpp\n{dep_text.rstrip()}\n```")
 
+    # Coverage-triggered revision feedback goes last so it sits closest to the
+    # output-format spec, where the model's attention is strongest.
+    if revision_feedback:
+        parts.append(revision_feedback)
+
     user_content = "\n\n".join(parts)
 
-    system_prompt = make_agent_system_prompt(str(selected_pdb_path), pdb_note)
+    system_prompt = make_agent_system_prompt()
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_content},

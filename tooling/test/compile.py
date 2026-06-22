@@ -10,6 +10,7 @@ from ..oracle.compile import (
     GEMMI_INCLUDE, CLIPPER_INCLUDE, BOOST_INCLUDE,
     MMDB_INCLUDE, GSL_INCLUDE, PNG_INCLUDE, GLM_INCLUDE,
     RDKIT_INCLUDE, ccp4_env, is_teardown_only_crash,
+    COOT_DEFINES_STR,
 )
 from ..db import PROJECT_ROOT
 
@@ -41,7 +42,7 @@ def make_test_compile_cmd(test_cc: Path, output_bin: Path) -> str:
     gsl_libraries = "-lgsl -lgslcblas"
 
     return (
-        f'{CXX} -std=c++20 -fno-access-control "{test_cc.absolute()}" -o "{output_bin.absolute()}" '
+        f'{CXX} -std=gnu++20 -fno-access-control {COOT_DEFINES_STR} "{test_cc.absolute()}" -o "{output_bin.absolute()}" '
         f'{includes} '
         f'-Wl,-rpath,{AUTOBUILD_LIB} '
         f'-Wl,-rpath,{COOT_BUILD_DIR} '
@@ -74,13 +75,18 @@ def _spawn_and_wait(cmd: list[str], cwd: str, timeout: int) -> tuple[int | None,
     import os
     import signal
 
+    # Capture BYTES and decode with errors="replace": test output loads real
+    # structures and can carry non-UTF-8 bytes (e.g. 0xb0 '°' in cell angles),
+    # which text=True would crash on with UnicodeDecodeError.
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         cwd=cwd, start_new_session=True, env=ccp4_env(),
     )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return proc.returncode, stdout, stderr
+        out_b, err_b = proc.communicate(timeout=timeout)
+        return (proc.returncode,
+                out_b.decode("utf-8", errors="replace"),
+                err_b.decode("utf-8", errors="replace"))
     except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
